@@ -15,6 +15,7 @@ base64. `python3 scripts/summarize.py FILE` turns a file into the tables.
 | llm_run5_2fd5039.jsonl | 2fd5039 | 1 | Kaggle T4; vLLM again, and per-kernel decode profiles at batch 1 and 8 |
 | llm_run6_843bf6d.jsonl | 843bf6d | 1 | Kaggle T4; packed prefill, which had a NaN bug (fixed next commit): its packed rows' outputs are wrong. Transcribed from the report's text |
 | llm_run7_64b6f55.jsonl | 64b6f55 | 1 | Kaggle T4; 32-row tiles for 32 sequences. Still before the packed-prefill NaN fix: the packed ("tessel") rows at batch 8 and 32 have wrong outputs; the tessel-no-pack rows are valid |
+| llm_run8_144b102.jsonl | 144b102 | 1 | Kaggle T4; packed prefill (fixed) and 32-row tiles: 1.05x vLLM with 32 sequences |
 | run3_c7ab694.jsonl | c7ab694 | 4 | Kaggle T4; swizzled staging; order alternating; rows carry their round, and clock samples per side |
 
 Runs 1 and 2 predate round tags in the rows: in both, each round wrote

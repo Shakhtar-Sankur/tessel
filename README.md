@@ -165,6 +165,24 @@ against vLLM's 1771 (0.86x, from 0.69x). With 8 sequences, 565 against
 vLLM's 638; one at a time, 98.6 against 73.3, vLLM's generations again
 identical to tessel's.
 
+Run 8 (commit 144b102, the packing fix and the 32-row tiles together;
+`bench/t4/llm_run8_144b102.jsonl`):
+
+| Requests at a time | tessel | tessel, one prompt per prefill step | vLLM 0.30 | transformers |
+|---|---|---|---|---|
+| 1 | **97.3** | | 68.7 | 29.4 |
+| 8 | 593 | 571 | **632** | 242 |
+| 32 | **1858** | 1566 | 1764 | 905 |
+
+Generated tokens per second over each run, the same 32 prompts. With 32
+sequences tessel now runs 1.05x vLLM (0.69x in run 4); with 8, 0.94x.
+Packing left all 32 generations identical with 8 sequences, and 29 of 32
+with 32 (the same 3853 tokens in all): the packed step is larger, so its
+matmuls are tuned to other tiles and round differently in fp16. The
+benchmark now records, for each generation packing changes, transformers'
+logit margin at the first token that differs, to show whether those are
+near-ties.
+
 Where the time goes, one sequence at a time (decode tokens per second):
 
 | | tokens/s | |

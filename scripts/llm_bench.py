@@ -116,6 +116,25 @@ def hf_generate(model, tok, prompts, max_new, batch, eos):
     return outs, time.perf_counter() - t
 
 
+def divergences(model, prompts, xs, ys):
+    """For each pair of generations that differ: where, the two tokens, and
+    transformers' (fp16) top-two logit margin and the gap between the two
+    tokens' logits there, given the shared history."""
+    out = []
+    for p, x, y in zip(prompts, xs, ys):
+        k = 0
+        while k < min(len(x), len(y)) and x[k] == y[k]:
+            k += 1
+        if x == y or k >= min(len(x), len(y)):
+            continue
+        with torch.no_grad():
+            lg = model(torch.tensor([p + x[:k]], device="cuda")).logits[0, -1].float()
+        top = torch.topk(lg, 2).values.tolist()
+        out.append({"at": k, "a": x[k], "b": y[k], "top2_margin": top[0] - top[1],
+                    "logit_gap": abs(float(lg[x[k]] - lg[y[k]])), "logit_scale": float(lg.abs().max())})
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--tessel", default="target/release/tessel")
@@ -175,7 +194,11 @@ def main():
                          "generated": npk["generated"], "seconds": npk["seconds"], "tokens_per_s": npk["tokens_per_s"],
                          "decode_tokens_per_s": npk["decode_tokens_per_s"],
                          # Packing must change only the speed, never a token.
-                         "identical_to_packed": sum(x == y for x, y in zip(npk["outputs"], t["outputs"]))})
+                         "identical_to_packed": sum(x == y for x, y in zip(npk["outputs"], t["outputs"])),
+                         # Where it does change one, how close the call was:
+                         # the margin between transformers' top two logits at
+                         # the first differing token (a near-tie is rounding).
+                         "packing_divergences": divergences(model, ps, t["outputs"], npk["outputs"])})
         if b in (1, 8, 32):
             # Where tessel's decode time goes, kernel by kernel.
             pr = tessel(a.tessel, path, ps, a.max_new, b, ["--profile"])
