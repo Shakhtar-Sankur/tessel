@@ -23,6 +23,7 @@ usage:
   tessel llm MODEL_DIR --prompts FILE [--max-new 64] [--batch 16] [--device cuda|emu]
              [--page 16] [--pages 1024] [--max-tokens 1024] [--warmup] [--json OUT]
              [--logits OUT]  (also writes the logits after the first prompt, as JSON)
+             [--no-graphs]   (launch every decode step's kernels one by one, not as a CUDA graph)
                (greedy generation with the engine of tessel kernels, continuous
                batching over a paged KV cache; MODEL_DIR is a Hugging Face Llama
                checkpoint, FILE a JSON list of token-id lists)
@@ -221,6 +222,7 @@ fn llm(args: &[String]) -> Result<(), String> {
     };
     let t = std::time::Instant::now();
     let mut e = Engine::new(dev, &w, lim)?;
+    e.graphs = !args.iter().any(|a| a == "--no-graphs");
     drop(w);
     let upload_s = t.elapsed().as_secs_f64();
     let batch = num("--batch", 16)?;
@@ -252,7 +254,7 @@ fn llm(args: &[String]) -> Result<(), String> {
         .collect();
     let ttft: Vec<String> = outs.iter().map(|o| format!("{:.4}", o.first_token_s)).collect();
     let line = format!(
-        "{{\"engine\": \"tessel\", \"device\": \"{:?}\", \"requests\": {}, \"batch\": {batch}, \"max_new\": {max_new}, \"prompt_tokens\": {}, \"generated\": {}, \"seconds\": {:.4}, \"tokens_per_s\": {:.2}, \"decode_steps\": {}, \"decode_seconds\": {:.4}, \"decode_tokens_per_s\": {:.2}, \"largest_batch\": {}, \"load_s\": {load_s:.2}, \"upload_s\": {upload_s:.2}, \"warmup_s\": {warm_s:.2}, \"first_token_s\": [{}], \"outputs\": [{}]}}",
+        "{{\"engine\": \"tessel\", \"device\": \"{:?}\", \"requests\": {}, \"batch\": {batch}, \"max_new\": {max_new}, \"prompt_tokens\": {}, \"generated\": {}, \"seconds\": {:.4}, \"tokens_per_s\": {:.2}, \"decode_steps\": {}, \"decode_seconds\": {:.4}, \"decode_tokens_per_s\": {:.2}, \"largest_batch\": {}, \"graphs\": {}, \"load_s\": {load_s:.2}, \"upload_s\": {upload_s:.2}, \"warmup_s\": {warm_s:.2}, \"first_token_s\": [{}], \"outputs\": [{}]}}",
         dev,
         reqs.len(),
         st.prompt_tokens,
@@ -263,6 +265,7 @@ fn llm(args: &[String]) -> Result<(), String> {
         st.decode_seconds,
         st.decode_tokens as f64 / st.decode_seconds.max(1e-9),
         st.largest_batch,
+        e.graphs,
         ttft.join(", "),
         ids.join(", ")
     );

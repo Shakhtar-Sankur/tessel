@@ -1,7 +1,10 @@
 #!/bin/bash
 # tessel's LLM engine on a Kaggle or Colab GPU: builds tessel, runs the
 # engine's tests on the GPU, then TinyLlama-1.1B-Chat against Hugging Face
-# transformers (scripts/llm_bench.py). Writes llm_report.txt.
+# transformers (scripts/llm_bench.py), vLLM (scripts/vllm_bench.py, in its
+# own environment) and llama.cpp (built with CUDA; scripts/llamacpp_bench.py).
+# Writes llm_report.txt. vLLM's install and llama.cpp's build take a while;
+# NO_VLLM=1 or NO_LLAMACPP=1 skips them.
 #
 # Kaggle (Accelerator "GPU T4 x2", Internet on) or Colab (T4 GPU), one cell:
 #   !git clone https://github.com/Shakhtar-Sankur/tessel && cd tessel && bash scripts/llm_colab.sh
@@ -32,6 +35,36 @@ OUT=bench/results/llm_runs.jsonl
 mkdir -p bench/results
 : > "$OUT"
 python3 scripts/llm_bench.py --json "$OUT" 2>&1 | grep -v "^Warning\|warn(" | tee -a "$REPORT"
+
+step "vLLM on the same prompts (its own environment; skip with NO_VLLM=1)"
+if [ -z "${NO_VLLM:-}" ]; then
+  (
+    pip install --quiet uv > /dev/null 2>&1
+    uv venv --quiet /tmp/vllm-env --python 3.12 && VIRTUAL_ENV=/tmp/vllm-env uv pip install --quiet vllm 2>&1 | tail -2
+    for b in 1 8 32; do
+      timeout 1200 /tmp/vllm-env/bin/python scripts/vllm_bench.py --batch "$b" --json "$OUT" 2> bench/results/vllm.err \
+        | grep '^{' || echo "vLLM batch $b failed: $(grep -v '^\s*$' bench/results/vllm.err | tail -3)"
+    done
+  ) 2>&1 | tee -a "$REPORT"
+fi
+
+step "llama.cpp, CUDA build, f16 GGUF (skip with NO_LLAMACPP=1)"
+if [ -z "${NO_LLAMACPP:-}" ]; then
+  (
+    L=/tmp/llama.cpp
+    [ -d $L ] || git clone --quiet --depth 1 https://github.com/ggml-org/llama.cpp $L
+    git -C $L log -1 --format='llama.cpp %h %cs'
+    cmake -S $L -B $L/build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release > $L/cmake.log 2>&1 \
+      && cmake --build $L/build --target llama-bench llama-batched-bench -j"$(nproc)" > $L/build.log 2>&1 \
+      || { echo "llama.cpp build failed: $(tail -5 $L/build.log $L/cmake.log)"; exit 0; }
+    pip install --quiet $L/gguf-py sentencepiece > /dev/null 2>&1
+    MODEL=$(python3 -c "import json; print(json.load(open('bench/results/llm_prompts.json'))['path'])")
+    python3 $L/convert_hf_to_gguf.py "$MODEL" --outtype f16 --outfile /tmp/model-f16.gguf > $L/convert.log 2>&1 \
+      || { echo "GGUF conversion failed: $(tail -5 $L/convert.log)"; exit 0; }
+    python3 scripts/llamacpp_bench.py --bin $L/build/bin --gguf /tmp/model-f16.gguf --json "$OUT" \
+      || echo "llama.cpp benchmark failed"
+  ) 2>&1 | tee -a "$REPORT"
+fi
 
 step "raw results (gzip + base64 of $OUT)"
 python3 -c "import gzip,base64;print(base64.b64encode(gzip.compress(open('$OUT','rb').read(),9)).decode())" | tee -a "$REPORT"

@@ -3,6 +3,7 @@
 //! drives the emulator, where buffers are host memory, and an NVIDIA GPU.
 
 use crate::cuda::Options;
+pub use crate::driver::GraphExec;
 use crate::interp::Tensor;
 use crate::ir::{self, Spec};
 use crate::kernels;
@@ -184,6 +185,24 @@ impl Gpu {
         }
         self.launches += 1;
         self.kernels[k.0].launch_raw(&raw)
+    }
+
+    /// Starts recording this device's launches into a CUDA graph instead of
+    /// running them (GPU only; launches of kernels compiled before).
+    pub fn capture_begin(&self) -> Result<(), String> {
+        runtime::cuda()?.begin_capture()
+    }
+
+    /// Ends the recording: the launches since `capture_begin`, as a graph.
+    pub fn capture_end(&self) -> Result<GraphExec, String> {
+        runtime::cuda()?.end_capture()
+    }
+
+    /// Runs a recorded graph (asynchronously): its launches, with the
+    /// arguments they had, on the buffers' current contents.
+    pub fn replay(&mut self, g: GraphExec) -> Result<(), String> {
+        self.launches += 1;
+        runtime::cuda()?.graph_launch(g)
     }
 
     pub fn sync(&self) -> Result<(), String> {

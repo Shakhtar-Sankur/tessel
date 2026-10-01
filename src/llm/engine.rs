@@ -3,7 +3,7 @@
 //! of tessel kernel launches.
 
 use super::{Config, Weights, rope_tables};
-use crate::gpu::{Arg, Buf, Gpu, K};
+use crate::gpu::{Arg, Buf, Gpu, GraphExec, K};
 use crate::runtime::Device;
 
 struct DevLayer {
@@ -42,6 +42,9 @@ pub enum Attn<'a> {
 
 pub struct Engine {
     pub gpu: Gpu,
+    /// Replay decode steps as CUDA graphs (one launch instead of hundreds).
+    pub graphs: bool,
+    graph: std::collections::HashMap<usize, GraphExec>,
     pub cfg: Config,
     pub lim: Limits,
     embed: Buf,
@@ -157,6 +160,8 @@ impl Engine {
             table: gpu.alloc(t * lim.max_seq_pages * 4)?,
             lens: gpu.alloc(t * 4)?,
             gpu,
+            graphs: true,
+            graph: std::collections::HashMap::new(),
             cfg,
             lim,
             embed,
@@ -188,9 +193,6 @@ impl Engine {
             return Err(format!("a step of {n} tokens (at most {})", self.lim.max_tokens));
         }
         let t = padded(n);
-        let cfg = self.cfg.clone();
-        let (dm, nh, ng, hd) = (cfg.dim, cfg.heads, cfg.kv_heads, cfg.head_dim);
-        let (w, f, v) = (cfg.qkv(), cfg.ffn, cfg.vocab);
         let ns = self.lim.pages * self.lim.page;
         // Inputs, padded: token 0 at position 0, writing to no slot.
         let mut tk = tokens.to_vec();
@@ -213,6 +215,48 @@ impl Engine {
             self.gpu.write(self.table, 0, &bytesi(&tb))?;
             self.gpu.write(self.lens, 0, &bytesi(&ln))?;
         }
+        // Rows whose logits are wanted.
+        let bw = (!want.is_empty()).then(|| padded(want.len()));
+        if let Some(bw) = bw {
+            let mut ix: Vec<i32> = want.iter().map(|&r| r as i32).collect();
+            ix.resize(bw, 0);
+            self.gpu.write(self.idx, 0, &bytesi(&ix))?;
+        }
+        let prefill = matches!(attn, Attn::Prefill);
+        if !prefill && self.graphs && self.gpu.dev == Device::Cuda && bw == Some(t) {
+            // A decode step of this size: replay its recorded launches, or
+            // run them and record them for the next time.
+            if let Some(&g) = self.graph.get(&t) {
+                self.gpu.replay(g)?;
+            } else {
+                self.launch_all(t, false, bw)?;
+                self.gpu.sync()?;
+                self.gpu.capture_begin()?;
+                let r = self.launch_all(t, false, bw);
+                let g = self.gpu.capture_end();
+                r?;
+                self.graph.insert(t, g?);
+            }
+        } else {
+            self.launch_all(t, prefill, bw)?;
+        }
+        if want.is_empty() {
+            return Ok(Vec::new());
+        }
+        let v = self.cfg.vocab;
+        let all = self.gpu.read_f32(self.logits, 0, want.len() * v)?;
+        Ok(all.chunks(v).map(|c| c.to_vec()).collect())
+    }
+
+    /// Launches one step's kernels for `t` rows (compiling them the first
+    /// time): the decoder, then, for `bw` rows of logits, the final norm and
+    /// the LM head.
+    fn launch_all(&mut self, t: usize, prefill: bool, bw: Option<usize>) -> Result<(), String> {
+        let cfg = self.cfg.clone();
+        let (dm, nh, ng, hd) = (cfg.dim, cfg.heads, cfg.kv_heads, cfg.head_dim);
+        let (w, f, v) = (cfg.qkv(), cfg.ffn, cfg.vocab);
+        let ns = self.lim.pages * self.lim.page;
+        let mp = self.lim.max_seq_pages;
         let bc = dm.next_power_of_two() as i64;
         let (mm, mw) = mm_meta(t, false);
         let (gm, gw) = mm_meta(t, true);
@@ -256,14 +300,14 @@ impl Engine {
             &[],
             1,
         )?;
-        let att = match attn {
-            Attn::Prefill => self.k(
+        let att = match prefill {
+            true => self.k(
                 "prefill_attention",
                 &[vec![t, nh, hd], vec![t, ng, hd], vec![t, ng, hd], vec![t, nh, hd]],
                 &[("BM", 64), ("BN", 64)],
                 4,
             )?,
-            Attn::Decode { .. } => {
+            false => {
                 let p = self.lim.page;
                 self.k(
                     "decode_attention",
@@ -310,9 +354,9 @@ impl Engine {
                     B(self.v),
                 ],
             )?;
-            match attn {
-                Attn::Prefill => g.launch(att, &[B(self.q), B(self.k), B(self.v), B(self.o), F32(scale)])?,
-                Attn::Decode { .. } => g.launch(
+            match prefill {
+                true => g.launch(att, &[B(self.q), B(self.k), B(self.v), B(self.o), F32(scale)])?,
+                false => g.launch(
                     att,
                     &[
                         B(self.q),
@@ -330,14 +374,7 @@ impl Engine {
             g.launch(gu, &[B(self.h), B(l.wg), B(l.wu), B(self.mlp)])?;
             g.launch(down, &[B(self.mlp), B(l.wd), B(self.x)])?;
         }
-        if want.is_empty() {
-            return Ok(Vec::new());
-        }
-        // Logits of the wanted rows only.
-        let bw = padded(want.len());
-        let mut ix: Vec<i32> = want.iter().map(|&r| r as i32).collect();
-        ix.resize(bw, 0);
-        self.gpu.write(self.idx, 0, &bytesi(&ix))?;
+        let Some(bw) = bw else { return Ok(()) };
         let (lm, lw) = mm_meta(bw, false);
         let fin = self.k(
             "rmsnorm_rows",
@@ -349,7 +386,6 @@ impl Engine {
         let g = &mut self.gpu;
         g.launch(fin, &[B(self.x), B(self.idx), B(self.norm), B(self.last), F32(eps)])?;
         g.launch(head, &[B(self.last), B(self.head), B(self.logits)])?;
-        let all = g.read_f32(self.logits, 0, want.len() * v)?;
-        Ok(all.chunks(v).map(|c| c.to_vec()).collect())
+        Ok(())
     }
 }

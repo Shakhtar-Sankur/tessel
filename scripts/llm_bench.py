@@ -140,6 +140,10 @@ def main():
         prompts.append([int(x) for x in tok(text, add_special_tokens=False)["input_ids"]])
     eos = tok.eos_token_id
     dev = torch.cuda.get_device_name(0)
+    # The prompts, for the other engines' scripts (vLLM, llama.cpp).
+    if a.json:
+        with open(os.path.join(os.path.dirname(a.json) or ".", "llm_prompts.json"), "w") as f:
+            json.dump({"model": a.model, "path": path, "eos": eos, "max_new": a.max_new, "prompts": prompts}, f)
     base = {"device": dev, "model": a.model}
 
     # 1. Logits after the first prompt: tessel against transformers in fp32.
@@ -170,6 +174,15 @@ def main():
         log(a.json, {**base, "kind": "generate", "engine": "transformers", "batch": b, "requests": len(ps),
                      "generated": n, "seconds": secs, "tokens_per_s": n / secs})
         if b == 1:
+            # The same without CUDA graphs: what replaying each decode step's
+            # launches as one graph saves.
+            ng = tessel(a.tessel, path, ps, a.max_new, b, ["--no-graphs"])
+            log(a.json, {**base, "kind": "generate", "engine": "tessel-no-graphs", "batch": b, "requests": len(ps),
+                         "generated": ng["generated"], "seconds": ng["seconds"], "tokens_per_s": ng["tokens_per_s"],
+                         "decode_tokens_per_s": ng["decode_tokens_per_s"]})
+            if a.json:
+                with open(os.path.join(os.path.dirname(a.json) or ".", "llm_tessel_outputs.json"), "w") as f:
+                    json.dump(t["outputs"], f)
             # Token-by-token agreement of the greedy generations (fp16 both).
             same = []
             for x, y in zip(t["outputs"], outs):
