@@ -24,3 +24,7 @@ jobs:
           echo "TESSEL_NVRTC=$(python3 -c 'import nvidia.cuda_nvrtc, os; print(os.path.join(nvidia.cuda_nvrtc.__path__[0], "lib", "libnvrtc.so.12"))')" >> "$GITHUB_ENV"
       - name: tests (the interpreter; every kernel's CUDA on the emulator; NVRTC for sm_75 and sm_80)
         run: cargo test --release
+      - name: TPU backend (every kernel in Pallas's TPU interpret mode, checked against NumPy, and lowered for TPU v5e)
+        run: |
+          pip install --quiet "jax==0.10.2" numpy
+          python3 scripts/pallas_check.py --lower

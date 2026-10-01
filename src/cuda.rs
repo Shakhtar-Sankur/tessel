@@ -367,69 +367,6 @@ impl<'a> G<'a> {
         }
     }
 
-    // ---------------- ranges of integer scalars ----------------
-
-    fn ranges(&mut self, b: &[Inst]) {
-        for i in b {
-            let out = i.outs.first().copied();
-            match &i.op {
-                Op::Const(x) if !self.ty(out.unwrap()).dtype.is_float() => {
-                    self.rng[out.unwrap()] = Some((*x as i64, *x as i64));
-                }
-                Op::ProgramId(a) => self.rng[out.unwrap()] = Some((0, self.k.grid[*a] as i64 - 1)),
-                Op::Binary(op, a, b)
-                    if self.ty(out.unwrap()).is_scalar() && self.ty(out.unwrap()).dtype == DType::I32 =>
-                {
-                    if let (Some(x), Some(y)) = (self.rng[*a], self.rng[*b]) {
-                        let fl = |p: i64, q: i64| p.div_euclid(q);
-                        self.rng[out.unwrap()] = match op {
-                            Bin::Add => Some((x.0 + y.0, x.1 + y.1)),
-                            Bin::Sub => Some((x.0 - y.1, x.1 - y.0)),
-                            Bin::Mul => {
-                                let c = [x.0 * y.0, x.0 * y.1, x.1 * y.0, x.1 * y.1];
-                                Some((*c.iter().min().unwrap(), *c.iter().max().unwrap()))
-                            }
-                            Bin::FloorDiv if y.0 > 0 => {
-                                let c = [fl(x.0, y.0), fl(x.0, y.1), fl(x.1, y.0), fl(x.1, y.1)];
-                                Some((*c.iter().min().unwrap(), *c.iter().max().unwrap()))
-                            }
-                            Bin::Mod if y.0 > 0 && x.0 >= 0 => Some((0, x.1.min(y.1 - 1))),
-                            Bin::Max => Some((x.0.max(y.0), x.1.max(y.1))),
-                            Bin::Min => Some((x.0.min(y.0), x.1.min(y.1))),
-                            _ => None,
-                        };
-                    }
-                }
-                Op::For {
-                    iv,
-                    start,
-                    end,
-                    step,
-                    body,
-                    args,
-                    ..
-                } => {
-                    for a in args {
-                        self.rng[*a] = None;
-                    }
-                    if let (Some(s), Some(e), Some(st)) = (self.rng[*start], self.rng[*end], self.rng[*step])
-                        && st.0 == st.1
-                        && st.0 > 0
-                    {
-                        let last = if s.0 == s.1 {
-                            s.0 + (e.1 - 1 - s.0).div_euclid(st.0) * st.0
-                        } else {
-                            e.1 - 1
-                        };
-                        self.rng[*iv] = Some((s.0, last.max(s.0)));
-                    }
-                    self.ranges(body);
-                }
-                _ => {}
-            }
-        }
-    }
-
     /// `size` positions from integer scalar `v` provably lie in `0..dim`.
     fn in_bounds(&self, v: V, size: usize, dim: usize) -> bool {
         matches!(self.rng[v], Some((lo, hi)) if lo >= 0 && hi + size as i64 <= dim as i64)
@@ -2013,7 +1950,7 @@ pub fn generate(k: &Kernel, o: &Options) -> Result<Generated, String> {
     g.rowwise = computed_a_operand(&k.body);
     g.assign(&k.body);
     g.divs(&k.body);
-    g.ranges(&k.body);
+    g.rng = crate::analysis::ranges(k);
     g.find_raw();
     g.gen_block(&k.body);
     let threads = 32 * o.warps;
