@@ -179,9 +179,16 @@ sequences tessel now runs 1.05x vLLM (0.69x in run 4); with 8, 0.94x.
 Packing left all 32 generations identical with 8 sequences, and 29 of 32
 with 32 (the same 3853 tokens in all): the packed step is larger, so its
 matmuls are tuned to other tiles and round differently in fp16. The
-benchmark now records, for each generation packing changes, transformers'
-logit margin at the first token that differs, to show whether those are
-near-ties.
+benchmark records, for each generation packing changes, transformers'
+logit margin at the first token that differs.
+
+Run 9 (commit 4a275cf, a new session; `bench/t4/llm_run9_4a275cf.jsonl`)
+repeats it: with 32 sequences tessel 1884 tokens/s against vLLM's 1798
+(1.05x again), with 8 635 against 643 (level), one at a time 100.0 against
+82.0, vLLM's generations again identical to tessel's. The three
+generations packing changes differ where transformers' own fp16 logits
+for the two tokens are 0.0, 0.0 and 0.0078 apart, at logits near 15,
+where fp16's step is 0.0078: ties, broken either way by rounding.
 
 Where the time goes, one sequence at a time (decode tokens per second):
 
