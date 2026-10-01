@@ -14,8 +14,9 @@ usage:
   tessel cuda  FILE KERNEL --shapes ... [--meta ...] [--warps 4]
   tessel run   FILE KERNEL --shapes ... [--meta ...] [--warps 4] [--device emu|cuda]
                (random inputs; every output checked against the interpreter)
-  tessel bench [--quick] [--iters 30] [--json OUT]
-               (the benchmark suite on the GPU, tuned per case)
+  tessel bench [--quick] [--iters 100] [--json OUT] [--tuned FILE]
+               (the benchmark suite on the GPU, tuned per case; FILE keeps the
+               chosen configurations, so later runs time only those)
 
 FILE is a .tl file, or the name of a built-in one (basic, matmul, attention).";
 
@@ -132,7 +133,8 @@ fn main() {
         }
         "bench" => {
             let quick = args.iter().any(|a| a == "--quick");
-            let iters = flag(&args, "--iters").map(|x| x.parse().unwrap_or(30)).unwrap_or(30);
+            let iters = flag(&args, "--iters").map(|x| x.parse().unwrap_or(100)).unwrap_or(100);
+            let tuned = flag(&args, "--tuned");
             let mut file = flag(&args, "--json").map(|p| {
                 std::fs::OpenOptions::new()
                     .create(true)
@@ -140,7 +142,7 @@ fn main() {
                     .open(p)
                     .unwrap_or_else(|e| die(&format!("{p}: {e}")))
             });
-            tessel::bench::run(quick, iters, &mut |line| {
+            tessel::bench::run(quick, iters, tuned, &mut |line| {
                 println!("{line}");
                 if let Some(f) = file.as_mut() {
                     let _ = writeln!(f, "{line}");

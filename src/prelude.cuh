@@ -274,6 +274,12 @@ static inline int kshfl_xor_i(int v, int m) {
 }
 static inline float rsqrtf(float x) { return 1.0f / sqrtf(x); }
 #endif
+// exp with the hardware's fast path (ex2.approx) on the GPU.
+#ifdef TSL_CUDA
+#define kexp(x) __expf(x)
+#else
+#define kexp(x) expf(x)
+#endif
 // A value rounded to f16 (f16 arithmetic happens in f32, rounded per op).
 KDEV float kr16(float x) { return kh2f(kf2h(x)); }
 // Floor division and modulo, as in Python (the tile language's semantics).

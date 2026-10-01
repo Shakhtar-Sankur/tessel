@@ -39,7 +39,9 @@ static NVRTC: OnceLock<Result<Nvrtc, String>> = OnceLock::new();
 
 /// The GPU, opened once per process.
 pub fn cuda() -> Result<&'static Cuda, String> {
-    CUDA.get_or_init(Cuda::open).as_ref().map_err(|e| e.clone())
+    let c = CUDA.get_or_init(Cuda::open).as_ref().map_err(|e| e.clone())?;
+    c.bind()?;
+    Ok(c)
 }
 
 pub fn nvrtc() -> Result<&'static Nvrtc, String> {

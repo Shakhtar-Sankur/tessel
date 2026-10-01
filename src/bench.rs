@@ -8,6 +8,7 @@ use crate::interp::Tensor;
 use crate::ir::{Spec, compile};
 use crate::kernels;
 use crate::runtime::{self, Device};
+use std::collections::HashMap;
 
 pub struct Rng(u64);
 
@@ -114,6 +115,8 @@ fn attention(r: &mut Rng, h: usize, s: usize, d: usize, quick: bool) -> Case {
         (vec![("BM", 64), ("BN", 32)], 4),
         (vec![("BM", 128), ("BN", 32)], 8),
         (vec![("BM", 32), ("BN", 64)], 2),
+        (vec![("BM", 128), ("BN", 64)], 4),
+        (vec![("BM", 64), ("BN", 128)], 4),
     ];
     if quick {
         configs.truncate(2);
@@ -253,9 +256,52 @@ fn json_str(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// Tunes and times every case on the GPU; one JSON line per case.
-pub fn run(quick: bool, iters: usize, out: &mut dyn FnMut(&str)) -> Result<(), String> {
+fn config_name(meta: &[(&str, i64)], warps: usize) -> String {
+    format!("{meta:?} warps {warps}")
+}
+
+/// Keeps the GPU busy for about a second, so timings start at the clock
+/// the GPU sustains rather than its idle boost.
+fn warm_up() -> Result<(), String> {
+    let n = 2048;
+    let spec = Spec {
+        shapes: vec![vec![n, n]; 3],
+        meta: vec![],
+    };
+    let k = compile(kernels::source("matmul").unwrap(), "matmul", &spec)?;
+    let c = runtime::compile(&k, Device::Cuda, &Options::default())?;
+    let mut r = Rng::new(1);
+    let args = vec![
+        r.tensor(DType::F16, &[n, n], 1.0),
+        r.tensor(DType::F16, &[n, n], 1.0),
+        Tensor::zeros(DType::F16, &[n, n]),
+    ];
+    let d = c.upload(&args)?;
+    let t = std::time::Instant::now();
+    while t.elapsed().as_secs_f64() < 1.5 {
+        for _ in 0..20 {
+            c.launch(&d)?;
+        }
+        runtime::cuda()?.sync()?;
+    }
+    Ok(())
+}
+
+/// Tunes (or takes the configuration tuned before, from `tuned`) and times
+/// every case on the GPU; one JSON line per case.
+pub fn run(quick: bool, iters: usize, tuned: Option<&str>, out: &mut dyn FnMut(&str)) -> Result<(), String> {
     let cuda = runtime::cuda()?;
+    let mut cache: HashMap<String, String> = HashMap::new();
+    if let Some(p) = tuned
+        && let Ok(text) = std::fs::read_to_string(p)
+    {
+        for l in text.lines() {
+            if let Some((k, v)) = l.split_once('\t') {
+                cache.insert(k.to_string(), v.to_string());
+            }
+        }
+    }
+    warm_up()?;
     for case in suite(quick) {
         let src = kernels::source(case.file).unwrap();
         let shapes: Vec<Vec<usize>> = case
@@ -264,59 +310,53 @@ pub fn run(quick: bool, iters: usize, out: &mut dyn FnMut(&str)) -> Result<(), S
             .filter(|t| !t.shape.is_empty())
             .map(|t| t.shape.clone())
             .collect();
+        let key = format!("{}|{}|{}", cuda.name, case.kind, case.label);
+        let chosen = cache.get(&key).cloned();
+        let candidates: Vec<&(Vec<(&str, i64)>, usize)> = case
+            .configs
+            .iter()
+            .filter(|(m, w)| chosen.as_ref().is_none_or(|c| *c == config_name(m, *w)))
+            .collect();
         let mut tried = Vec::new();
-        let mut best: Option<(f64, f64, usize)> = None;
-        let mut compiled = Vec::new();
+        let mut best: Option<(f64, runtime::Compiled, String)> = None;
         let mut dev_args = None;
-        for (ci, (meta, warps)) in case.configs.iter().enumerate() {
+        for (meta, warps) in candidates {
+            let name = config_name(meta, *warps);
             let spec = Spec {
                 shapes: shapes.clone(),
                 meta: meta.iter().map(|(n, x)| (n.to_string(), *x)).collect(),
             };
-            let k = match compile(src, case.kernel, &spec) {
-                Ok(k) => k,
-                Err(e) => {
-                    tried.push(format!(
-                        "{{\"config\": {}, \"error\": {}}}",
-                        json_str(&format!("{meta:?} w{warps}")),
-                        json_str(&e)
-                    ));
-                    continue;
-                }
-            };
-            let c = match runtime::compile(
-                &k,
-                Device::Cuda,
-                &Options {
-                    warps: *warps,
-                    arch: 75,
-                },
-            ) {
+            let c = compile(src, case.kernel, &spec).and_then(|k| {
+                runtime::compile(
+                    &k,
+                    Device::Cuda,
+                    &Options {
+                        warps: *warps,
+                        arch: 75,
+                    },
+                )
+            });
+            let c = match c {
                 Ok(c) => c,
                 Err(e) => {
                     tried.push(format!(
                         "{{\"config\": {}, \"error\": {}}}",
-                        json_str(&format!("{meta:?} w{warps}")),
+                        json_str(&name),
                         json_str(e.lines().next().unwrap_or(""))
                     ));
-                    compiled.push(None);
                     continue;
                 }
             };
             if dev_args.is_none() {
                 dev_args = Some(c.upload(&case.args)?);
             }
-            let (med, min) = c.time(dev_args.as_ref().unwrap(), iters)?;
-            tried.push(format!(
-                "{{\"config\": {}, \"median_ms\": {med:.4}}}",
-                json_str(&format!("{meta:?} w{warps}"))
-            ));
-            if best.is_none_or(|b| med < b.0) {
-                best = Some((med, min, ci));
+            let (med, _) = c.time(dev_args.as_ref().unwrap(), 20)?;
+            tried.push(format!("{{\"config\": {}, \"median_ms\": {med:.4}}}", json_str(&name)));
+            if best.as_ref().is_none_or(|b| med < b.0) {
+                best = Some((med, c, name));
             }
-            compiled.push(Some(c));
         }
-        let Some((med, min, ci)) = best else {
+        let Some((_, c, name)) = best else {
             out(&format!(
                 "{{\"kind\": {}, \"label\": {}, \"engine\": \"tessel\", \"error\": \"no configuration compiled\", \"tried\": [{}]}}",
                 json_str(case.kind),
@@ -325,18 +365,21 @@ pub fn run(quick: bool, iters: usize, out: &mut dyn FnMut(&str)) -> Result<(), S
             ));
             continue;
         };
-        // Check the best configuration's output.
-        let c = compiled.iter().flatten().find(|c| {
-            let (meta, warps) = &case.configs[ci];
-            c.code.threads == 32 * warps && meta.iter().all(|(n, x)| c.kernel.meta(n) == Some(*x))
-        });
-        let c = c.unwrap();
+        if chosen.is_none()
+            && let Some(p) = tuned
+        {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p) {
+                let _ = writeln!(f, "{key}\t{name}");
+            }
+        }
+        // The chosen configuration, timed again with more launches.
+        let (med, min) = c.time(dev_args.as_ref().unwrap(), iters)?;
         let d = c.upload(&case.args)?;
         c.launch(&d)?;
         let mut got = case.args.clone();
         c.download(&d, &mut got)?;
         let err = (case.verify)(&got);
-        let (meta, warps) = &case.configs[ci];
         let tflops = if case.flops > 0.0 {
             case.flops / (med * 1e-3) / 1e12
         } else {
@@ -348,7 +391,7 @@ pub fn run(quick: bool, iters: usize, out: &mut dyn FnMut(&str)) -> Result<(), S
             json_str(case.kind),
             json_str(&case.label),
             json_str(&cuda.name),
-            json_str(&format!("{meta:?} warps {warps}")),
+            json_str(&name),
             tried.join(", ")
         ));
     }

@@ -64,6 +64,8 @@ struct G<'a> {
     lay: Vec<Lay>,
     def: Vec<Option<&'a Inst>>,
     div: Vec<u64>,
+    /// Ranges of integer scalars, where known.
+    rng: Vec<Option<(i64, i64)>>,
     out: String,
     ind: usize,
     scopes: Vec<HashMap<(V, usize), String>>,
@@ -79,6 +81,14 @@ struct G<'a> {
     raw: HashMap<V, usize>,
     /// Loads already issued by a loop's software pipeline.
     prefetched: std::collections::HashSet<V>,
+    /// Parity variables of the enclosing loops (double-buffered staging).
+    loops: Vec<String>,
+    /// Matmul operands staged once before the loop that uses them:
+    /// (value, is A) -> (shared-memory pointer, row length, transposed).
+    prestaged: HashMap<(V, bool), (String, usize, bool)>,
+    /// Some matmul takes a computed tile as A (attention's P @ V): keep
+    /// warps along rows so it can be fed from registers.
+    rowwise: bool,
 }
 
 /// Cache key of a value's packed-halves form.
@@ -163,6 +173,12 @@ impl<'a> G<'a> {
     fn acc_layout(&mut self, shape: &[usize], dt: DType) -> usize {
         let (bm, bn) = (shape[0], shape[1]);
         let w = self.o.warps;
+        if dt == DType::F16 && self.rowwise && bm / w >= 16 && bm.is_multiple_of(w) {
+            let l = Layout::mma(shape, w, 1);
+            let id = self.lid(l, 3);
+            self.mma.insert(id);
+            return id;
+        }
         if dt == DType::F16 {
             // Warp tiles as square as possible: fewer fragment loads per mma.
             let mut best = None;
@@ -349,6 +365,74 @@ impl<'a> G<'a> {
         if let Some(o) = out {
             self.lay[o] = l;
         }
+    }
+
+    // ---------------- ranges of integer scalars ----------------
+
+    fn ranges(&mut self, b: &[Inst]) {
+        for i in b {
+            let out = i.outs.first().copied();
+            match &i.op {
+                Op::Const(x) if !self.ty(out.unwrap()).dtype.is_float() => {
+                    self.rng[out.unwrap()] = Some((*x as i64, *x as i64));
+                }
+                Op::ProgramId(a) => self.rng[out.unwrap()] = Some((0, self.k.grid[*a] as i64 - 1)),
+                Op::Binary(op, a, b)
+                    if self.ty(out.unwrap()).is_scalar() && self.ty(out.unwrap()).dtype == DType::I32 =>
+                {
+                    if let (Some(x), Some(y)) = (self.rng[*a], self.rng[*b]) {
+                        let fl = |p: i64, q: i64| p.div_euclid(q);
+                        self.rng[out.unwrap()] = match op {
+                            Bin::Add => Some((x.0 + y.0, x.1 + y.1)),
+                            Bin::Sub => Some((x.0 - y.1, x.1 - y.0)),
+                            Bin::Mul => {
+                                let c = [x.0 * y.0, x.0 * y.1, x.1 * y.0, x.1 * y.1];
+                                Some((*c.iter().min().unwrap(), *c.iter().max().unwrap()))
+                            }
+                            Bin::FloorDiv if y.0 > 0 => {
+                                let c = [fl(x.0, y.0), fl(x.0, y.1), fl(x.1, y.0), fl(x.1, y.1)];
+                                Some((*c.iter().min().unwrap(), *c.iter().max().unwrap()))
+                            }
+                            Bin::Mod if y.0 > 0 && x.0 >= 0 => Some((0, x.1.min(y.1 - 1))),
+                            Bin::Max => Some((x.0.max(y.0), x.1.max(y.1))),
+                            Bin::Min => Some((x.0.min(y.0), x.1.min(y.1))),
+                            _ => None,
+                        };
+                    }
+                }
+                Op::For {
+                    iv,
+                    start,
+                    end,
+                    step,
+                    body,
+                    args,
+                    ..
+                } => {
+                    for a in args {
+                        self.rng[*a] = None;
+                    }
+                    if let (Some(s), Some(e), Some(st)) = (self.rng[*start], self.rng[*end], self.rng[*step])
+                        && st.0 == st.1
+                        && st.0 > 0
+                    {
+                        let last = if s.0 == s.1 {
+                            s.0 + (e.1 - 1 - s.0).div_euclid(st.0) * st.0
+                        } else {
+                            e.1 - 1
+                        };
+                        self.rng[*iv] = Some((s.0, last.max(s.0)));
+                    }
+                    self.ranges(body);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// `size` positions from integer scalar `v` provably lie in `0..dim`.
+    fn in_bounds(&self, v: V, size: usize, dim: usize) -> bool {
+        matches!(self.rng[v], Some((lo, hi)) if lo >= 0 && hi + size as i64 <= dim as i64)
     }
 
     // ---------------- divisibility of integer scalars ----------------
@@ -595,7 +679,7 @@ impl<'a> G<'a> {
         let f = d.is_float();
         match op {
             Un::Neg => format!("(-{x})"),
-            Un::Exp => format!("expf({x})"),
+            Un::Exp => format!("kexp({x})"),
             Un::Log => format!("logf({x})"),
             Un::Sqrt => format!("sqrtf({x})"),
             Un::Rsqrt => format!("rsqrtf({x})"),
@@ -807,11 +891,18 @@ impl<'a> G<'a> {
                     let raw = self.raw.contains_key(&o);
                     let name = self.decl_load(o);
                     let ix = self.ix_subst(idx, *iv, &format!("({s})"), body, args);
-                    self.load_into(&name, raw, o, *arr, &ix, *other);
+                    // Guarded by the loop condition: index ranges hold only
+                    // for indices the loop runs.
+                    let guard = format!("({s}) < ({e})");
+                    self.load_into(&name, raw, o, *arr, &ix, *other, Some(&guard));
                     pipes.push((*li, name, raw));
                 }
+                self.prestage(body);
+                let par = self.fresh("p");
+                self.line(&format!("int {par} = 0;"));
                 self.scal.insert(*iv, ivn.clone());
                 self.line(&format!("for (int {ivn} = {s}; {ivn} < {e}; {ivn} += {st}) {{"));
+                self.loops.push(par.clone());
                 self.ind += 1;
                 self.scopes.push(HashMap::new());
                 for (a, n) in args.iter().zip(&names) {
@@ -836,7 +927,8 @@ impl<'a> G<'a> {
                         unreachable!()
                     };
                     let ix = self.ix_subst(idx, *iv, &format!("({ivn} + {st})"), body, args);
-                    self.load_into(name, *raw, li.outs[0], *arr, &ix, *other);
+                    let guard = format!("({ivn} + {st}) < ({e})");
+                    self.load_into(name, *raw, li.outs[0], *arr, &ix, *other, Some(&guard));
                 }
                 self.gen_block(body);
                 // Yields: every new value first, then the assignments.
@@ -867,6 +959,8 @@ impl<'a> G<'a> {
                         _ => unreachable!(),
                     }
                 }
+                self.line(&format!("{par} ^= 1;"));
+                self.loops.pop();
                 self.scopes.pop();
                 self.ind -= 1;
                 self.line("}");
@@ -1001,7 +1095,11 @@ impl<'a> G<'a> {
         for (d, (size, e, v)) in ix.iter().enumerate() {
             base.push(format!("(long long)({e}) * {}", st[d]));
             match size {
-                None => cond.push(format!("(unsigned)({e}) < {}u", dims[d])),
+                None => {
+                    if !self.in_bounds(*v, 1, dims[d]) {
+                        cond.push(format!("(unsigned)({e}) < {}u", dims[d]))
+                    }
+                }
                 Some(_) => sl.push((st[d], e.clone(), dims[d], *v)),
             }
         }
@@ -1054,11 +1152,18 @@ impl<'a> G<'a> {
     fn elem(&mut self, id: usize, k: usize, sl: &[SliceDim]) -> (String, String) {
         let (r, c) = self.rc(id, k);
         let coords: Vec<String> = if sl.len() == 2 { vec![r, c] } else { vec![c] };
+        let sizes: Vec<usize> = if sl.len() == 2 {
+            self.layouts[id].shape.clone()
+        } else {
+            vec![self.layouts[id].cols()]
+        };
         let mut off = Vec::new();
         let mut cond = Vec::new();
-        for ((st, s, dim, _), x) in sl.iter().zip(&coords) {
+        for (((st, s, dim, sv), x), size) in sl.iter().zip(&coords).zip(&sizes) {
             off.push(if *st == 1 { x.clone() } else { format!("{x} * {st}") });
-            cond.push(format!("(unsigned)({s} + {x}) < {dim}u"));
+            if !self.in_bounds(*sv, *size, *dim) {
+                cond.push(format!("(unsigned)({s} + {x}) < {dim}u"));
+            }
         }
         (off.join(" + "), cond.join(" && "))
     }
@@ -1108,19 +1213,33 @@ impl<'a> G<'a> {
         }
         let raw = self.raw.contains_key(&out);
         let name = self.decl_load(out);
-        self.load_into(&name, raw, out, arr, &ix, other);
+        self.load_into(&name, raw, out, arr, &ix, other, None);
         let key = if raw { RAW } else { self.lid_of(out) };
         self.cache(out, key, name);
     }
 
     /// Fills `name` with the tile load `out` at indices `ix`.
-    fn load_into(&mut self, name: &str, raw: bool, out: V, arr: usize, ix: &[(Option<usize>, String, V)], other: f64) {
+    #[allow(clippy::too_many_arguments)]
+    fn load_into(
+        &mut self,
+        name: &str,
+        raw: bool,
+        out: V,
+        arr: usize,
+        ix: &[(Option<usize>, String, V)],
+        other: f64,
+        guard: Option<&str>,
+    ) {
         let PKind::Array { dtype, .. } = self.k.params[arr].kind else {
             unreachable!()
         };
         let id = self.lid_of(out);
         let p = self.arr_ptr(arr);
         let (b, m, sl) = self.block_access(arr, ix);
+        let m = match guard {
+            Some(g) => format!("({m} && ({g}))"),
+            None => m,
+        };
         let nr = self.layouts[id].nregs();
         let o = lit(other, dtype);
         let v = match sl.last() {
@@ -1398,109 +1517,106 @@ impl<'a> G<'a> {
             self.line(&format!("{acc}[{k}] = {cv}[{k}];"));
         }
         if self.mma.contains(&id) {
-            let (an, al, araw, atr) = self.operand(a);
-            let (bn_, bl, braw, btr) = self.operand(b);
-            // Staged tiles: A as [m][k] (or [k][m] if transposed), B as
-            // [k][n] (or [n][k]); rows padded by 16 bytes, which spreads the
-            // eight rows an ldmatrix reads over distinct banks.
-            let (ar, ac) = if atr { (bk, bm) } else { (bm, bk) };
-            let (br, bc) = if btr { (bn, bk) } else { (bk, bn) };
-            let (lda, ldb) = (ac + 8, bc + 8);
-            let bytes_a = ar * lda * 2;
-            self.dot_smem = self.dot_smem.max(bytes_a + br * ldb * 2);
-            let (sa, sb) = (self.fresh("As"), self.fresh("Bs"));
-            self.line("KSYNC();");
-            self.line(&format!("khalf *{sa} = (khalf *)(tsmem + TSO_DOT);"));
-            self.line(&format!("khalf *{sb} = (khalf *)(tsmem + TSO_DOT + {bytes_a});"));
-            let av = if araw { Some(self.raw[&self.raw_src(a)]) } else { None };
-            let bv = if braw { Some(self.raw[&self.raw_src(b)]) } else { None };
-            self.stage(&sa, lda, &an, al, av);
-            self.stage(&sb, ldb, &bn_, bl, bv);
-            self.line("KSYNC();");
             let l = self.layouts[id].clone();
             let wbits_m = l.warp.iter().filter(|&&w| w >= bn as u32).count();
             let wm = 1usize << wbits_m;
             let wn = self.o.warps / wm;
             let (tm, tn) = (bm / wm, bn / wn);
             let (nm, nn) = (tm / 16, tn / 8);
+            let areg = self.reg_operand(a, id);
+            let mut staged = false;
+            let pa = if areg.is_none() {
+                Some(self.place(a, true, &mut staged))
+            } else {
+                None
+            };
+            let (sb, ldb, btr) = self.place(b, false, &mut staged);
+            if staged {
+                self.line("KSYNC();");
+            }
             self.line("{");
             self.ind += 1;
             self.line(&format!(
                 "const int r0 = (warp & {}) * {tm}, c0 = (warp >> {wbits_m}) * {tn};",
                 wm - 1
             ));
-            self.line("#pragma unroll");
-            self.line(&format!("for (int kk = 0; kk < {bk}; kk += 16) {{"));
-            self.ind += 1;
-            self.line(&format!("unsigned fa[{}], fb[{}];", 4 * nm, 2 * nn));
-            for mi in 0..nm {
-                if atr {
-                    self.line(&format!(
-                        "kldm4t(&fa[{}], {sa} + (kk + (lane >> 4) * 8 + (lane & 7)) * {lda} + r0 + {} + ((lane >> 3) & 1) * 8);",
-                        4 * mi,
-                        mi * 16
-                    ));
-                } else {
-                    self.line(&format!(
-                        "kldm4(&fa[{}], {sa} + (r0 + {} + (lane & 15)) * {lda} + kk + (lane >> 4) * 8);",
-                        4 * mi,
-                        mi * 16
-                    ));
+            let nna = bk / 8;
+            for kk in (0..bk).step_by(16) {
+                self.line("{");
+                self.ind += 1;
+                self.line(&format!("unsigned fa[{}], fb[{}];", 4 * nm, 2 * nn));
+                for mi in 0..nm {
+                    match (&areg, &pa) {
+                        (Some(an), _) => {
+                            // An accumulator-layout tile is already an A fragment.
+                            let (j0, j1) = (4 * (kk / 8 + nna * mi), 4 * (kk / 8 + 1 + nna * mi));
+                            self.line(&format!(
+                                "fa[{}] = kpack({an}[{j0}], {an}[{}]); fa[{}] = kpack({an}[{}], {an}[{}]); fa[{}] = kpack({an}[{j1}], {an}[{}]); fa[{}] = kpack({an}[{}], {an}[{}]);",
+                                4 * mi, j0 + 1, 4 * mi + 1, j0 + 2, j0 + 3, 4 * mi + 2, j1 + 1, 4 * mi + 3, j1 + 2, j1 + 3
+                            ));
+                        }
+                        (None, Some((sa, lda, true))) => self.line(&format!(
+                            "kldm4t(&fa[{}], {sa} + ({kk} + (lane >> 4) * 8 + (lane & 7)) * {lda} + r0 + {} + ((lane >> 3) & 1) * 8);",
+                            4 * mi,
+                            mi * 16
+                        )),
+                        (None, Some((sa, lda, false))) => self.line(&format!(
+                            "kldm4(&fa[{}], {sa} + (r0 + {} + (lane & 15)) * {lda} + {kk} + (lane >> 4) * 8);",
+                            4 * mi,
+                            mi * 16
+                        )),
+                        _ => unreachable!(),
+                    }
                 }
-            }
-            let mut ni = 0;
-            while ni < nn {
-                let pair = ni + 1 < nn;
-                let n0 = ni * 8;
-                let (f, addr) = match (btr, pair) {
-                    (false, true) => (
-                        "kldm4t",
-                        format!(
-                            "{sb} + (kk + ((lane >> 3) & 1) * 8 + (lane & 7)) * {ldb} + c0 + {n0} + (lane >> 4) * 8"
+                let mut ni = 0;
+                while ni < nn {
+                    let pair = ni + 1 < nn;
+                    let n0 = ni * 8;
+                    let (f, addr) = match (btr, pair) {
+                        (false, true) => (
+                            "kldm4t",
+                            format!(
+                                "{sb} + ({kk} + ((lane >> 3) & 1) * 8 + (lane & 7)) * {ldb} + c0 + {n0} + (lane >> 4) * 8"
+                            ),
                         ),
-                    ),
-                    (false, false) => (
-                        "kldm2t",
-                        format!("{sb} + (kk + ((lane >> 3) & 1) * 8 + (lane & 7)) * {ldb} + c0 + {n0}"),
-                    ),
-                    (true, true) => (
-                        "kldm4",
-                        format!(
-                            "{sb} + (c0 + {n0} + (lane >> 4) * 8 + (lane & 7)) * {ldb} + kk + ((lane >> 3) & 1) * 8"
+                        (false, false) => (
+                            "kldm2t",
+                            format!("{sb} + ({kk} + ((lane >> 3) & 1) * 8 + (lane & 7)) * {ldb} + c0 + {n0}"),
                         ),
-                    ),
-                    (true, false) => (
-                        "kldm2",
-                        format!("{sb} + (c0 + {n0} + (lane & 7)) * {ldb} + kk + ((lane >> 3) & 1) * 8"),
-                    ),
-                };
-                if pair {
+                        (true, true) => (
+                            "kldm4",
+                            format!(
+                                "{sb} + (c0 + {n0} + (lane >> 4) * 8 + (lane & 7)) * {ldb} + {kk} + ((lane >> 3) & 1) * 8"
+                            ),
+                        ),
+                        (true, false) => (
+                            "kldm2",
+                            format!("{sb} + (c0 + {n0} + (lane & 7)) * {ldb} + {kk} + ((lane >> 3) & 1) * 8"),
+                        ),
+                    };
                     self.line(&format!("{f}(&fb[{}], {addr});", 2 * ni));
-                    ni += 2;
-                } else {
-                    self.line(&format!("{f}(&fb[{}], {addr});", 2 * ni));
-                    ni += 1;
+                    ni += if pair { 2 } else { 1 };
                 }
-            }
-            for mi in 0..nm {
-                for ni in 0..nn {
-                    let at = 4 * (ni + nn * mi);
-                    self.line(&format!(
-                        "kmma(&{acc}[{at}], fa[{}], fa[{}], fb[{}]);",
-                        4 * mi,
-                        4 * mi + 1,
-                        2 * ni
-                    ));
-                    self.line(&format!(
-                        "kmma(&{acc}[{at}], fa[{}], fa[{}], fb[{}]);",
-                        4 * mi + 2,
-                        4 * mi + 3,
-                        2 * ni + 1
-                    ));
+                for mi in 0..nm {
+                    for ni in 0..nn {
+                        let at = 4 * (ni + nn * mi);
+                        self.line(&format!(
+                            "kmma(&{acc}[{at}], fa[{}], fa[{}], fb[{}]);",
+                            4 * mi,
+                            4 * mi + 1,
+                            2 * ni
+                        ));
+                        self.line(&format!(
+                            "kmma(&{acc}[{at}], fa[{}], fa[{}], fb[{}]);",
+                            4 * mi + 2,
+                            4 * mi + 3,
+                            2 * ni + 1
+                        ));
+                    }
                 }
+                self.ind -= 1;
+                self.line("}");
             }
-            self.ind -= 1;
-            self.line("}");
             self.ind -= 1;
             self.line("}");
         } else {
@@ -1517,11 +1633,14 @@ impl<'a> G<'a> {
             let bv = self.get(b, lb);
             let (lda, ldb) = (bm + 4, bn + 4);
             let bytes_a = bk * lda * 4;
-            self.dot_smem = self.dot_smem.max(bytes_a + bk * ldb * 4);
+            let base = self.alloc(bytes_a + bk * ldb * 4);
             let (sa, sb) = (self.fresh("As"), self.fresh("Bs"));
             self.line("KSYNC();");
-            self.line(&format!("float *{sa} = (float *)(tsmem + TSO_DOT);"));
-            self.line(&format!("float *{sb} = (float *)(tsmem + TSO_DOT + {bytes_a});"));
+            self.line(&format!("float *{sa} = (float *)(tsmem + TSO_DOT + {base});"));
+            self.line(&format!(
+                "float *{sb} = (float *)(tsmem + TSO_DOT + {});",
+                base + bytes_a
+            ));
             for k in 0..self.layouts[la].nregs() {
                 let (r, cc) = self.rc(la, k);
                 self.line(&format!("{sa}[{cc} * {lda} + {r}] = {av}[{k}];"));
@@ -1567,6 +1686,100 @@ impl<'a> G<'a> {
             self.line("}");
         }
         self.cache(out, id, acc);
+    }
+
+    /// Bytes of shared memory for a matmul's staging, at a fresh offset.
+    fn alloc(&mut self, bytes: usize) -> usize {
+        let off = self.dot_smem;
+        self.dot_smem += bytes.next_multiple_of(16);
+        off
+    }
+
+    /// A matmul's A operand straight from registers: a tile whose layout is
+    /// the accumulator layout of the same rows with every warp on its own
+    /// rows (as P in attention, the result of the previous matmul).
+    fn reg_operand(&mut self, a: V, out: usize) -> Option<String> {
+        let t = self.ty(a);
+        let Lay::L(la) = self.lay[a] else { return None };
+        let w = self.o.warps;
+        let want = Layout::mma(&t.shape, w, 1);
+        let rowwise_out = self.layouts[out] == Layout::mma(&self.layouts[out].shape.clone(), w, 1);
+        if !rowwise_out || self.layouts[la] != want || self.raw.contains_key(&a) {
+            return None;
+        }
+        Some(self.get(a, la))
+    }
+
+    /// Where a matmul operand sits in shared memory: (pointer, row length,
+    /// transposed), staging it here unless it was staged before its loop.
+    /// Inside a loop, staging alternates between two buffers by iteration,
+    /// so one barrier per iteration suffices.
+    fn place(&mut self, x: V, is_a: bool, staged: &mut bool) -> (String, usize, bool) {
+        if let Some(p) = self.prestaged.get(&(x, is_a)) {
+            return p.clone();
+        }
+        let (name, l, raw, tr) = self.operand(x);
+        let t = self.ty(x);
+        let (r, c) = if tr {
+            (t.shape[1], t.shape[0])
+        } else {
+            (t.shape[0], t.shape[1])
+        };
+        let ld = c + 8;
+        let bytes = (r * ld * 2).next_multiple_of(16);
+        let s = self.fresh("S");
+        match self.loops.last().cloned() {
+            Some(par) => {
+                let off = self.alloc(2 * bytes);
+                self.line(&format!(
+                    "khalf *{s} = (khalf *)(tsmem + TSO_DOT + {off} + {par} * {bytes});"
+                ));
+            }
+            None => {
+                let off = self.alloc(bytes);
+                self.line(&format!("khalf *{s} = (khalf *)(tsmem + TSO_DOT + {off});"));
+            }
+        }
+        let v = if raw { Some(self.raw[&self.raw_src(x)]) } else { None };
+        self.stage(&s, ld, &name, l, v);
+        *staged = true;
+        (s, ld, tr)
+    }
+
+    /// Before a loop: stages once the matmul operands its body uses but
+    /// does not compute.
+    fn prestage(&mut self, body: &'a [Inst]) {
+        let defs = defs_in(body);
+        let mut todo = Vec::new();
+        for i in body {
+            if let Op::Dot(a, b, _) = &i.op
+                && matches!(self.lay[i.outs[0]], Lay::L(id) if self.mma.contains(&id))
+            {
+                let id = self.lid_of(i.outs[0]);
+                for (x, is_a) in [(*a, true), (*b, false)] {
+                    let computed_a = is_a && {
+                        let w = self.o.warps;
+                        matches!(self.lay[x], Lay::L(la) if self.layouts[la] == Layout::mma(&self.ty(x).shape, w, 1))
+                            && self.layouts[id] == Layout::mma(&self.layouts[id].shape.clone(), w, 1)
+                    };
+                    if !defs.contains(&x) && !computed_a && !self.prestaged.contains_key(&(x, is_a)) {
+                        todo.push((x, is_a));
+                    }
+                }
+            }
+        }
+        if todo.is_empty() {
+            return;
+        }
+        self.line("KSYNC();");
+        let saved = std::mem::take(&mut self.loops);
+        for (x, is_a) in todo {
+            let mut staged = false;
+            let p = self.place(x, is_a, &mut staged);
+            self.prestaged.insert((x, is_a), p);
+        }
+        self.loops = saved;
+        self.line("KSYNC();");
     }
 
     /// The packed load behind a matmul operand.
@@ -1679,6 +1892,33 @@ impl<'a> G<'a> {
     }
 }
 
+/// Does some matmul take as A a tile that is neither a load nor a
+/// transposed load (a computed tile, such as attention's probabilities)?
+fn computed_a_operand(b: &[Inst]) -> bool {
+    let mut defs: HashMap<V, &Op> = HashMap::new();
+    fn walk<'b>(b: &'b [Inst], defs: &mut HashMap<V, &'b Op>, found: &mut bool) {
+        for i in b {
+            for &o in &i.outs {
+                defs.insert(o, &i.op);
+            }
+            match &i.op {
+                Op::Dot(a, _, _) => {
+                    let is_load = |v: &V, d: &HashMap<V, &Op>| matches!(d.get(v), Some(Op::Load { .. }));
+                    let ok = is_load(a, defs) || matches!(defs.get(a), Some(Op::Trans(y)) if is_load(y, defs));
+                    if !ok {
+                        *found = true;
+                    }
+                }
+                Op::For { body, .. } => walk(body, defs, found),
+                _ => {}
+            }
+        }
+    }
+    let mut found = false;
+    walk(b, &mut defs, &mut found);
+    found
+}
+
 fn defs_in(b: &[Inst]) -> std::collections::HashSet<V> {
     let mut s = std::collections::HashSet::new();
     for i in b {
@@ -1754,6 +1994,7 @@ pub fn generate(k: &Kernel, o: &Options) -> Result<Generated, String> {
         lay: vec![Lay::Unset; n],
         def: vec![None; n],
         div: vec![1; n],
+        rng: vec![None; n],
         out: String::new(),
         ind: 1,
         scopes: vec![HashMap::new()],
@@ -1765,9 +2006,14 @@ pub fn generate(k: &Kernel, o: &Options) -> Result<Generated, String> {
         mma: std::collections::HashSet::new(),
         raw: HashMap::new(),
         prefetched: std::collections::HashSet::new(),
+        loops: Vec::new(),
+        prestaged: HashMap::new(),
+        rowwise: false,
     };
+    g.rowwise = computed_a_operand(&k.body);
     g.assign(&k.body);
     g.divs(&k.body);
+    g.ranges(&k.body);
     g.find_raw();
     g.gen_block(&k.body);
     let threads = 32 * o.warps;

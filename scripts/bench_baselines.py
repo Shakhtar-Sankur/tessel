@@ -15,9 +15,17 @@ Usage: python scripts/bench_baselines.py [--quick] [--iters 30] [--json OUT]
 """
 
 import argparse
+import glob
 import json
 import math
+import os
+import shutil
 import sys
+
+# Triton's compiled kernels land here, so we can check what they use.
+TRITON_CACHE = "/tmp/tessel_triton_cache"
+shutil.rmtree(TRITON_CACHE, ignore_errors=True)
+os.environ["TRITON_CACHE_DIR"] = TRITON_CACHE
 
 import torch
 import torch.nn.functional as F
@@ -158,7 +166,7 @@ def rel(err, scale):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--quick", action="store_true")
-    ap.add_argument("--iters", type=int, default=30)
+    ap.add_argument("--iters", type=int, default=100)
     ap.add_argument("--json")
     a = ap.parse_args()
     dev = torch.cuda.get_device_name(0)
@@ -177,6 +185,16 @@ def main():
 
     def skip(kind, label, engine, e):
         print(json.dumps({"kind": kind, "label": label, "engine": engine, "error": str(e).splitlines()[0][:200]}), flush=True)
+
+    # Warm up, so timings start at the clock the GPU sustains.
+    w = torch.randn(2048, 2048, device="cuda", dtype=torch.float16)
+    torch.cuda.synchronize()
+    import time
+    t = time.time()
+    while time.time() - t < 1.5:
+        for _ in range(20):
+            torch.matmul(w, w)
+        torch.cuda.synchronize()
 
     def uni(*shape, dtype=torch.float16, scale=1.0):
         return ((torch.rand(*shape, device="cuda", generator=g) * 2 - 1) * scale).to(dtype)
@@ -267,6 +285,18 @@ def main():
             emit("rmsnorm", f"{R}x{C} f16", name, med, mn, err, 0, 4.0 * R * C)
         except Exception as e:  # noqa: BLE001
             skip("rmsnorm", f"{R}x{C} f16", name, e)
+
+
+    # Does Triton's matmul use tensor cores on this GPU? (mma instructions
+    # in the PTX it generated.)
+    if triton is not None:
+        ptx = [p for p in glob.glob(f"{TRITON_CACHE}/**/*.ptx", recursive=True) if "_matmul" in os.path.basename(p)]
+        uses = any("mma." in open(p).read() for p in ptx)
+        note = {"kind": "note", "engine": "triton", "triton_version": triton.__version__, "matmul_ptx_files": len(ptx),
+                "matmul_uses_mma": uses}
+        print(json.dumps(note), flush=True)
+        if out:
+            out.write(json.dumps(note) + "\n")
 
 
 if __name__ == "__main__":

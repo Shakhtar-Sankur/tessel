@@ -84,6 +84,8 @@ pub struct Cuda {
     cuStreamEndCapture: unsafe extern "C" fn(Stream, *mut Graph) -> CuResult,
     cuGraphInstantiateWithFlags: unsafe extern "C" fn(*mut *mut c_void, Graph, u64) -> CuResult,
     cuGraphLaunch: unsafe extern "C" fn(*mut c_void, Stream) -> CuResult,
+    cuCtxSetCurrent: unsafe extern "C" fn(Ctx) -> CuResult,
+    ctx: Ctx,
     pub name: String,
     /// Compute capability (major, minor).
     pub cc: (i32, i32),
@@ -137,6 +139,8 @@ impl Cuda {
             cuStreamEndCapture: sym(h, "cuStreamEndCapture")?,
             cuGraphInstantiateWithFlags: sym(h, "cuGraphInstantiateWithFlags")?,
             cuGraphLaunch: sym(h, "cuGraphLaunch")?,
+            cuCtxSetCurrent,
+            ctx: std::ptr::null_mut(),
             name: String::new(),
             cc: (0, 0),
             sms: 0,
@@ -159,11 +163,19 @@ impl Cuda {
             c.name = CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned();
             c.check(cuDevicePrimaryCtxRetain(&mut ctx, dev), "cuDevicePrimaryCtxRetain")?;
             c.check(cuCtxSetCurrent(ctx), "cuCtxSetCurrent")?;
+            c.ctx = ctx;
             let mut st = std::ptr::null_mut();
             c.check((c.cuStreamCreate)(&mut st, 1), "cuStreamCreate")?;
             c.stream = st;
         }
         Ok(c)
+    }
+
+    /// Makes the device's context current on the calling thread (contexts
+    /// are per thread; the tests drive the GPU from several).
+    pub fn bind(&self) -> Result<(), String> {
+        // SAFETY: the context was retained in open() and is never released.
+        self.check(unsafe { (self.cuCtxSetCurrent)(self.ctx) }, "cuCtxSetCurrent")
     }
 
     pub fn check(&self, r: CuResult, what: &str) -> Result<(), String> {

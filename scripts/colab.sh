@@ -11,7 +11,7 @@
 #
 # Usage: bash scripts/colab.sh [ROUNDS]
 set -u
-ROUNDS=${1:-2}
+ROUNDS=${1:-3}
 cd "$(dirname "$0")/.."
 REPORT=$PWD/colab_report.txt
 : > "$REPORT"
@@ -37,12 +37,17 @@ cargo build --release 2>&1 | tail -2 | tee -a "$REPORT"
 step "tests (every kernel on the emulator and on this GPU)"
 cargo test --release 2>&1 | grep -E "^test |test result|panicked|error" | tee -a "$REPORT"
 
-step "benchmark ($ROUNDS rounds)"
+step "benchmark ($ROUNDS rounds; tessel tunes in the first, then reuses its choices)"
 OUT=bench/results/gpu_runs.jsonl
+TUNED=bench/results/tuned.txt
 mkdir -p bench/results
 : > "$OUT"
+: > "$TUNED"
+gpu() { nvidia-smi --query-gpu=clocks.sm,clocks.max.sm,power.draw,temperature.gpu --format=csv,noheader 2>&1; }
 for r in $(seq "$ROUNDS"); do
-  ./target/release/tessel bench --json "$OUT" > /dev/null || log "tessel bench failed"
+  log "round $r: GPU (SM MHz, max MHz, W, C) before tessel: $(gpu)"
+  ./target/release/tessel bench --json "$OUT" --tuned "$TUNED" > /dev/null || log "tessel bench failed"
+  log "round $r: GPU before baselines: $(gpu)"
   python3 scripts/bench_baselines.py --json "$OUT" > /dev/null 2> bench/results/baselines.err || log "baselines failed: $(tail -1 bench/results/baselines.err)"
   log "round $r done"
 done

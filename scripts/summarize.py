@@ -60,6 +60,10 @@ def main(path):
             errs[r["engine"]] = max(errs[r["engine"]], r.get("rel_err", 0.0))
         print("\nLargest error against a float64 reference (relative to the largest value): "
               + ", ".join(f"{NAMES[e]} {errs[e]:.1e}" for e in engines) + "\n")
+    notes = [json.loads(l) for l in open(path) if l.strip() and '"note"' in l]
+    for n in notes[-1:]:
+        print(f"Triton {n['triton_version']}: its matmul PTX ({n['matmul_ptx_files']} files) "
+              + ("uses" if n["matmul_uses_mma"] else "does NOT use") + " tensor-core mma instructions on this GPU.\n")
     tuned = [r for r in rows if r["engine"] == "tessel"]
     if tuned:
         print("tessel's tuned configurations:")
