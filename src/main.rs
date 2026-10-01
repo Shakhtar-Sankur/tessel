@@ -20,7 +20,15 @@ usage:
                (the benchmark suite on the GPU, tuned per case; FILE keeps the
                chosen configurations, so later runs time only those)
 
-FILE is a .tl file, or the name of a built-in one (basic, matmul, attention).";
+  tessel llm MODEL_DIR --prompts FILE [--max-new 64] [--batch 16] [--device cuda|emu]
+             [--page 16] [--pages 1024] [--max-tokens 1024] [--warmup] [--json OUT]
+             [--logits OUT]  (also writes the logits after the first prompt, as JSON)
+               (greedy generation with the engine of tessel kernels, continuous
+               batching over a paged KV cache; MODEL_DIR is a Hugging Face Llama
+               checkpoint, FILE a JSON list of token-id lists)
+  tessel llm-tiny DIR   (writes a small random Llama checkpoint, for trying llm)
+
+FILE is a .tl file, or the name of a built-in one (basic, matmul, attention, llm).";
 
 fn die(msg: &str) -> ! {
     eprintln!("tessel: {msg}");
@@ -134,6 +142,17 @@ fn main() {
                 }
             }
         }
+        "llm" => {
+            if let Err(e) = llm(&args) {
+                die(&e);
+            }
+        }
+        "llm-tiny" => {
+            let dir = args.get(2).unwrap_or_else(|| die(USAGE));
+            let w = tessel::llm::Weights::random(&tessel::llm::Config::tiny(), 1);
+            tessel::llm::safetensors::save(&w, std::path::Path::new(dir)).unwrap_or_else(|e| die(&e));
+            println!("wrote a tiny random Llama to {dir}");
+        }
         "bench" => {
             let quick = args.iter().any(|a| a == "--quick");
             let iters = flag(&args, "--iters").map(|x| x.parse().unwrap_or(100)).unwrap_or(100);
@@ -157,4 +176,99 @@ fn main() {
             println!("{USAGE}");
         }
     }
+}
+
+fn llm(args: &[String]) -> Result<(), String> {
+    use tessel::llm::engine::{Engine, Limits};
+    use tessel::llm::safetensors::{Json, load, parse_json};
+    use tessel::llm::sched::{Request, generate};
+    let dir = args.get(2).ok_or(USAGE)?;
+    let num = |k: &str, d: usize| -> Result<usize, String> {
+        flag(args, k)
+            .map(|x| x.parse().map_err(|_| format!("bad {k}")))
+            .unwrap_or(Ok(d))
+    };
+    let dev = match flag(args, "--device").unwrap_or("cuda") {
+        "emu" => Device::Emu,
+        "cuda" => Device::Cuda,
+        d => return Err(format!("unknown device {d}")),
+    };
+    let path = flag(args, "--prompts").ok_or("--prompts is required")?;
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    let Json::Arr(ps) = parse_json(&text)? else {
+        return Err(format!("{path}: not a JSON list"));
+    };
+    let max_new = num("--max-new", 64)?;
+    let reqs: Vec<Request> = ps
+        .iter()
+        .map(|p| match p {
+            Json::Arr(ids) => Ok(Request {
+                prompt: ids.iter().map(|x| x.num().unwrap_or(0.0) as i32).collect(),
+                max_new,
+            }),
+            _ => Err(format!("{path}: each prompt is a list of token ids")),
+        })
+        .collect::<Result<_, _>>()?;
+    let t = std::time::Instant::now();
+    let w = load(std::path::Path::new(dir))?;
+    let load_s = t.elapsed().as_secs_f64();
+    let page = num("--page", 16)?;
+    let lim = Limits {
+        page,
+        pages: num("--pages", 1024)?,
+        max_tokens: num("--max-tokens", 1024)?,
+        max_seq_pages: (w.cfg.max_pos / page).max(1),
+    };
+    let t = std::time::Instant::now();
+    let mut e = Engine::new(dev, &w, lim)?;
+    drop(w);
+    let upload_s = t.elapsed().as_secs_f64();
+    let batch = num("--batch", 16)?;
+    if let Some(p) = flag(args, "--logits") {
+        use tessel::llm::engine::Attn;
+        let pr = &reqs[0].prompt;
+        let n = pr.len();
+        let pos: Vec<i32> = (0..n as i32).collect();
+        let l = e.step(pr, &pos, &pos, Attn::Prefill, &[n - 1])?;
+        let v: Vec<String> = l[0].iter().map(|x| format!("{x:e}")).collect();
+        std::fs::write(p, format!("[{}]\n", v.join(", "))).map_err(|e| format!("{p}: {e}"))?;
+    }
+    let mut warm_s = 0.0;
+    if args.iter().any(|a| a == "--warmup") {
+        // The same work once, so the timed run finds every kernel compiled.
+        let t = std::time::Instant::now();
+        generate(&mut e, &reqs, batch)?;
+        warm_s = t.elapsed().as_secs_f64();
+    }
+    let (outs, st) = generate(&mut e, &reqs, batch)?;
+    let ids: Vec<String> = outs
+        .iter()
+        .map(|o| {
+            format!(
+                "[{}]",
+                o.tokens.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(", ")
+            )
+        })
+        .collect();
+    let ttft: Vec<String> = outs.iter().map(|o| format!("{:.4}", o.first_token_s)).collect();
+    let line = format!(
+        "{{\"engine\": \"tessel\", \"device\": \"{:?}\", \"requests\": {}, \"batch\": {batch}, \"max_new\": {max_new}, \"prompt_tokens\": {}, \"generated\": {}, \"seconds\": {:.4}, \"tokens_per_s\": {:.2}, \"decode_steps\": {}, \"decode_seconds\": {:.4}, \"decode_tokens_per_s\": {:.2}, \"largest_batch\": {}, \"load_s\": {load_s:.2}, \"upload_s\": {upload_s:.2}, \"warmup_s\": {warm_s:.2}, \"first_token_s\": [{}], \"outputs\": [{}]}}",
+        dev,
+        reqs.len(),
+        st.prompt_tokens,
+        st.generated,
+        st.seconds,
+        st.generated as f64 / st.seconds,
+        st.decode_steps,
+        st.decode_seconds,
+        st.decode_tokens as f64 / st.decode_seconds.max(1e-9),
+        st.largest_batch,
+        ttft.join(", "),
+        ids.join(", ")
+    );
+    println!("{line}");
+    if let Some(p) = flag(args, "--json") {
+        std::fs::write(p, format!("{line}\n")).map_err(|e| format!("{p}: {e}"))?;
+    }
+    Ok(())
 }

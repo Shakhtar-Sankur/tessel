@@ -1,0 +1,169 @@
+"""tessel's LLM engine against Hugging Face transformers on one GPU.
+
+Downloads TinyLlama-1.1B-Chat (or --model), builds chat prompts, and:
+
+1. Correctness: the logits after the first prompt, tessel's against
+   transformers' in float32; then greedy generations of both (fp16 for
+   transformers), compared token by token.
+2. Throughput: greedy generation of every prompt (--max-new tokens each),
+   by tessel (continuous batching, at each --batch) and by transformers
+   (generate on a left-padded batch of the same size), as generated tokens
+   per second; and one sequence alone, as milliseconds per token.
+
+Prints one JSON line per measurement; with --json, appends them to a file.
+usage: python scripts/llm_bench.py [--tessel target/release/tessel] [--json OUT]
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import tempfile
+import time
+
+import numpy as np
+import torch
+
+QUESTIONS = [
+    "Explain how a hash map handles collisions.",
+    "Write a haiku about the ocean at night.",
+    "What causes the seasons on Earth?",
+    "Give three tips for writing clear technical documentation.",
+    "Summarize the plot of Romeo and Juliet in two sentences.",
+    "How does a transistor work?",
+    "What is the difference between TCP and UDP?",
+    "Describe the water cycle to a ten-year-old.",
+    "Why is the sky blue?",
+    "List five uses of a paperclip.",
+    "What is gradient descent?",
+    "Write a short story opening about a lighthouse keeper.",
+    "How do vaccines train the immune system?",
+    "Compare Python lists and tuples.",
+    "What makes a good password?",
+    "Explain recursion with an example.",
+    "What is the capital of Australia, and why was it chosen?",
+    "How do airplanes stay in the air?",
+    "Give a recipe for a simple tomato soup.",
+    "What is a black hole?",
+    "Explain what a database index is.",
+    "Write a limerick about a cat who codes.",
+    "How does compound interest work?",
+    "What are the main causes of inflation?",
+    "Describe how photosynthesis works.",
+    "What is the difference between a virus and a bacterium?",
+    "Explain the Pythagorean theorem.",
+    "How does a refrigerator keep food cold?",
+    "What is version control and why use it?",
+    "Give advice for a first job interview.",
+    "How do noise-cancelling headphones work?",
+    "What is the role of mitochondria in a cell?",
+]
+
+
+def log(out, row):
+    line = json.dumps(row)
+    print(line, flush=True)
+    if out:
+        with open(out, "a") as f:
+            f.write(line + "\n")
+
+
+def tessel(exe, model, prompts, max_new, batch, extra=()):
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "prompts.json")
+        o = os.path.join(d, "out.json")
+        json.dump(prompts, open(p, "w"))
+        cmd = [exe, "llm", model, "--prompts", p, "--max-new", str(max_new), "--batch", str(batch),
+               "--warmup", "--json", o, *extra]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"tessel llm failed: {r.stderr.strip()[-2000:]}")
+        return json.loads(open(o).read())
+
+
+def hf_generate(model, tok, prompts, max_new, batch, eos):
+    """Greedy generation in left-padded batches; (outputs, seconds)."""
+    outs = []
+    torch.cuda.synchronize()
+    t = time.perf_counter()
+    for i in range(0, len(prompts), batch):
+        group = prompts[i : i + batch]
+        n = max(len(p) for p in group)
+        ids = torch.tensor([[tok.pad_token_id] * (n - len(p)) + p for p in group], device="cuda")
+        mask = torch.tensor([[0] * (n - len(p)) + [1] * len(p) for p in group], device="cuda")
+        g = model.generate(input_ids=ids, attention_mask=mask, max_new_tokens=max_new, do_sample=False,
+                           pad_token_id=tok.pad_token_id, eos_token_id=eos)
+        for row in g[:, n:].tolist():
+            # Up to and including the first end-of-sequence token, as tessel stops.
+            out = []
+            for x in row:
+                out.append(x)
+                if x == eos:
+                    break
+            outs.append(out)
+    torch.cuda.synchronize()
+    return outs, time.perf_counter() - t
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tessel", default="target/release/tessel")
+    ap.add_argument("--model", default="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+    ap.add_argument("--max-new", type=int, default=128)
+    ap.add_argument("--batches", default="1,8,32")
+    ap.add_argument("--json")
+    a = ap.parse_args()
+    from huggingface_hub import snapshot_download
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    path = snapshot_download(a.model, allow_patterns=["*.json", "*.safetensors", "tokenizer*"])
+    tok = AutoTokenizer.from_pretrained(path)
+    if tok.pad_token_id is None:
+        tok.pad_token_id = tok.eos_token_id
+    prompts = [tok.apply_chat_template([{"role": "user", "content": q}], add_generation_prompt=True) for q in QUESTIONS]
+    eos = tok.eos_token_id
+    dev = torch.cuda.get_device_name(0)
+    base = {"device": dev, "model": a.model}
+
+    # 1. Logits after the first prompt: tessel against transformers in fp32.
+    t_out = tessel(a.tessel, path, prompts[:1], 1, 1,
+                   ["--logits", os.path.join(tempfile.gettempdir(), "tessel_logits.json")])
+    ours = np.array(json.load(open(os.path.join(tempfile.gettempdir(), "tessel_logits.json"))), np.float64)
+    m32 = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.float32).cuda().eval()
+    with torch.no_grad():
+        ref = m32(torch.tensor([prompts[0]], device="cuda")).logits[0, -1].double().cpu().numpy()
+    del m32
+    torch.cuda.empty_cache()
+    top5 = len(set(np.argsort(-ours)[:5]) & set(np.argsort(-ref)[:5]))
+    log(a.json, {**base, "kind": "logits", "max_abs_diff": float(np.abs(ours - ref).max()),
+                 "rel_to_max": float(np.abs(ours - ref).max() / np.abs(ref).max()),
+                 "top1_same": bool(ours.argmax() == ref.argmax()), "top5_overlap": top5})
+
+    # 2. Throughput and generations.
+    model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.float16).cuda().eval()
+    for b in [int(x) for x in a.batches.split(",")]:
+        ps = prompts[:4] if b == 1 else prompts
+        t = tessel(a.tessel, path, ps, a.max_new, b)
+        log(a.json, {**base, "kind": "generate", "engine": "tessel", "batch": b, "requests": len(ps),
+                     "generated": t["generated"], "seconds": t["seconds"], "tokens_per_s": t["tokens_per_s"],
+                     "decode_tokens_per_s": t["decode_tokens_per_s"], "warmup_s": t["warmup_s"]})
+        hf_generate(model, tok, ps[:b], 8, b, eos)  # warm up
+        outs, secs = hf_generate(model, tok, ps, a.max_new, b, eos)
+        n = sum(len(o) for o in outs)
+        log(a.json, {**base, "kind": "generate", "engine": "transformers", "batch": b, "requests": len(ps),
+                     "generated": n, "seconds": secs, "tokens_per_s": n / secs})
+        if b == 1:
+            # Token-by-token agreement of the greedy generations (fp16 both).
+            same = []
+            for x, y in zip(t["outputs"], outs):
+                k = 0
+                while k < min(len(x), len(y)) and x[k] == y[k]:
+                    k += 1
+                same.append(k)
+            log(a.json, {**base, "kind": "agreement", "prompts": len(same), "max_new": a.max_new,
+                         "matching_prefix": same, "identical": sum(x == y for x, y in zip(t["outputs"], outs)),
+                         "sample_tessel": tok.decode(t["outputs"][0]), "sample_transformers": tok.decode(outs[0])})
+
+
+if __name__ == "__main__":
+    main()

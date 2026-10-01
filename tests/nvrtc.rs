@@ -119,3 +119,117 @@ fn kernels_compile_for_t4_and_a100() {
         }
     }
 }
+
+/// The LLM engine's kernels at TinyLlama-1.1B's shapes (dim 2048, 32 heads,
+/// 4 KV heads of 64, MLP 5632, vocab 32000), for a decode step of 16 rows
+/// and a 512-token prompt, as the engine compiles them.
+#[test]
+fn llm_kernels_compile_at_tinyllama_shapes() {
+    let nv = match runtime::nvrtc() {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("skipped: {e}");
+            return;
+        }
+    };
+    let (dm, nh, ng, hd, f, v, npos) = (2048, 32, 4, 64, 5632, 32000, 2048);
+    let (w, ns, np, p, mp) = ((nh + 2 * ng) * hd, 16384, 1024, 16, 128);
+    for t in [16usize, 512] {
+        let mm: &[(&str, i64)] = if t >= 64 {
+            &[("BM", 64), ("BN", 128), ("BK", 32)]
+        } else {
+            &[("BM", 16), ("BN", 64), ("BK", 64)]
+        };
+        let gm: &[(&str, i64)] = &[("BM", 64), ("BN", 64), ("BK", 32)];
+        let cases: Vec<(&str, Spec, usize)> = vec![
+            ("embed", spec(&[&[t], &[v, dm], &[t, dm]], &[("BD", 1024)]), 4),
+            ("rmsnorm", spec(&[&[t, dm], &[dm], &[t, dm]], &[("BC", 2048)]), 4),
+            ("linear", spec(&[&[t, dm], &[w, dm], &[t, w]], mm), 4),
+            (
+                "rope_q",
+                spec(&[&[t, w], &[t], &[npos, hd / 2], &[npos, hd / 2], &[t, nh, hd]], &[]),
+                1,
+            ),
+            (
+                "kv_write",
+                spec(
+                    &[
+                        &[t, w],
+                        &[t],
+                        &[t],
+                        &[npos, hd / 2],
+                        &[npos, hd / 2],
+                        &[ns, ng, hd],
+                        &[ns, ng, hd],
+                        &[t, ng, hd],
+                        &[t, ng, hd],
+                    ],
+                    &[],
+                ),
+                1,
+            ),
+            (
+                "prefill_attention",
+                spec(
+                    &[&[t, nh, hd], &[t, ng, hd], &[t, ng, hd], &[t, nh, hd]],
+                    &[("BM", 64), ("BN", 64)],
+                ),
+                4,
+            ),
+            (
+                "decode_attention",
+                spec(
+                    &[
+                        &[t, nh, hd],
+                        &[np, p, ng, hd],
+                        &[np, p, ng, hd],
+                        &[t, mp],
+                        &[t],
+                        &[t, nh, hd],
+                    ],
+                    &[],
+                ),
+                1,
+            ),
+            (
+                "linear_residual",
+                spec(&[&[t, nh * hd], &[dm, nh * hd], &[t, dm]], mm),
+                4,
+            ),
+            (
+                "gate_up",
+                spec(&[&[t, dm], &[f, dm], &[f, dm], &[t, f]], if t >= 64 { gm } else { mm }),
+                4,
+            ),
+            ("linear_residual", spec(&[&[t, f], &[dm, f], &[t, dm]], mm), 4),
+            (
+                "rmsnorm_rows",
+                spec(&[&[t, dm], &[16], &[dm], &[16, dm]], &[("BC", 2048)]),
+                4,
+            ),
+            (
+                "logits",
+                spec(&[&[16, dm], &[v, dm], &[16, v]], &[("BM", 16), ("BN", 64), ("BK", 64)]),
+                4,
+            ),
+        ];
+        for (name, sp, warps) in cases {
+            let k = compile(&src("llm"), name, &sp).unwrap();
+            let g = generate(&k, &Options { warps, arch: 75 }).unwrap();
+            let (_, log) = nv
+                .compile(&g.source, 75, true)
+                .unwrap_or_else(|e| panic!("{name} T={t}: {e}"));
+            let spills = log
+                .lines()
+                .any(|l| l.contains("bytes spill stores") && !l.contains(" 0 bytes spill stores"));
+            let regs = log
+                .lines()
+                .find(|l| l.contains("registers"))
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            eprintln!("{name} T={t}: {regs}");
+            assert!(!spills, "{name} T={t} spills registers:\n{log}");
+        }
+    }
+}

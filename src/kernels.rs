@@ -4,6 +4,7 @@ pub const FILES: &[(&str, &str)] = &[
     ("basic", include_str!("../kernels/basic.tl")),
     ("matmul", include_str!("../kernels/matmul.tl")),
     ("attention", include_str!("../kernels/attention.tl")),
+    ("llm", include_str!("../kernels/llm.tl")),
 ];
 
 /// The source of kernel file `name` (without `.tl`).

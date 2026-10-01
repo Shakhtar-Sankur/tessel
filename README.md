@@ -42,37 +42,59 @@ attention, softmax, RMSNorm).
 
 ## Results on a Tesla T4
 
-Run 2 (commit 3966b0e, Colab T4, 3 rounds; raw rows in `bench/t4/`).
+Run 3 (commit c7ab694, a Kaggle T4, 4 rounds; raw rows in `bench/t4/`).
 tessel's speed relative to the fastest other engine timed in the same
 round, as the median of the rounds (above 1 is faster):
 
 | Case | tessel, ms | Fastest other, ms | tessel's speed | Rounds |
 |---|---|---|---|---|
-| GEMM 1024³, fp16, fp32 accumulation | 0.106 | cuBLAS 0.081 | 0.74x | 0.33, 1.07, 0.74 |
-| GEMM 2048³ | 1.059 | cuBLAS 0.756 | 0.71x | 0.39, 0.71, 0.87 |
-| GEMM 4096³ | 7.676 | cuBLAS 7.649 | **1.01x** | 1.01, 1.00, 1.03 |
-| Causal attention, 32 heads, D 64, S 512 | 0.101 | SDPA 0.279 | **2.69x** | 1.33, 2.69, 3.33 |
-| S 1024 | 0.280 | SDPA 0.411 | **1.51x** | 0.63, 1.51, 1.75 |
-| S 2048 | 1.440 | SDPA 1.732 | **1.18x** | 0.74, 1.24, 1.18 |
-| S 4096 | 4.870 | SDPA 6.554 | **1.35x** | 1.31, 1.35, 1.35 |
-| Softmax 4096x4096, fp32 | 0.588 (228 GB/s) | Triton 0.661 | **1.13x** | 1.12, 1.13, 1.13 |
-| RMSNorm 4096x4096, fp16 | 0.295 (228 GB/s) | torch.compile 0.429 | **1.46x** | 1.51, 1.46, 1.43 |
+| GEMM 1024³, fp16, fp32 accumulation | 0.148 | cuBLAS 0.148 | **1.00x** | 0.58, 1.08, 1.14, 0.93 |
+| GEMM 2048³ | 0.985 | cuBLAS 0.941 | **1.00x** | 1.04, 0.93, 1.02, 0.98 |
+| GEMM 4096³ | 7.381 | cuBLAS 7.357 | **1.04x** | 1.02, 0.94, 1.08, 1.06 |
+| Causal attention, 32 heads, D 64, S 512 | 0.146 | SDPA 0.276 | **1.90x** | 1.11, 1.95, 1.91, 1.88 |
+| S 1024 | 0.405 | SDPA 0.526 | **1.28x** | 0.88, 1.30, 1.27, 1.35 |
+| S 2048 | 1.247 | SDPA 1.642 | **1.36x** | 1.45, 1.36, 0.98, 1.37 |
+| S 4096 | 4.416 | SDPA 6.362 | **1.44x** | 1.61, 1.44, 1.44, 1.44 |
+| Softmax 4096x4096, fp32 | 0.583 (230 GB/s) | Triton 0.628 | **1.07x** | 1.06, 1.06, 1.07, 1.12 |
+| RMSNorm 4096x4096, fp16 | 0.291 (231 GB/s) | torch.compile 0.368 | **1.27x** | 1.24, 1.26, 1.29, 1.27 |
 
 Times are medians of the rounds' medians (100 launches each); every
 output is checked against a float64 reference, and tessel's errors match
-the baselines' (3e-4 relative for fp16 GEMM and attention). SDPA is
-`torch.nn.functional.scaled_dot_product_attention` (PyTorch 2.11).
-Triton 3.6 does not use tensor cores on the T4 (its matmul PTX has no
-`mma`), so it is far behind on GEMM and attention there (152 ms at
-4096³) and is left out of the table.
+the baselines' (3e-4 relative for fp16 GEMM and attention). cuBLAS is
+`torch.matmul` with fp16 reduction disabled (fp32 accumulation, as
+tessel); SDPA is `torch.nn.functional.scaled_dot_product_attention`
+(PyTorch 2.10). Triton 3.6 does not use tensor cores on the T4 (its
+matmul PTX has no `mma`), so it is far behind on GEMM and attention there
+(152 ms at 4096³) and is left out of the table.
 
-How to read it: the T4 throttles as it heats (cuBLAS's 2048³ took 0.55,
-0.76 and 0.89 ms in rounds 1 to 3), and in this run tessel always ran
-first and tuned in round 1 on a GPU still at idle clocks, which is its
-low first round. Later commits alternate the order between rounds, warm
-both sides up the same way and log the clocks while each side runs; they
-also stage GEMM operands with an XOR swizzle instead of padding, so two
-128x128 blocks fit on an SM. Those have not been measured on a GPU yet.
+How to read it: the T4 throttles as it heats, so the rounds alternate
+which side runs first and the table compares each round's numbers with
+each other. tessel's first round is low where it also tunes (compiling
+between timings lets the clocks fall). Run 2, before the GEMM operands
+were XOR-swizzled in shared memory (so two 128x128 blocks fit on an SM),
+had GEMM at 0.74x and 0.71x of cuBLAS at 1024³ and 2048³.
+
+## An LLM engine on tessel kernels
+
+`src/llm` runs Llama-family models (Llama, TinyLlama, Mistral-style
+grouped-query attention) with every GPU operation a tessel kernel from
+`kernels/llm.tl`: embedding, RMSNorm, the fused QKV, output and MLP
+projections (gate and up in one pass, SiLU fused), rotary embeddings,
+writes into a paged KV cache, causal prefill attention and paged decode
+attention, both grouped-query, and the LM head over only the rows that
+need logits. A scheduler batches continuously: sequences join as cache
+pages allow, every step decodes one token for each, and a finished
+sequence frees its pages at once. Steps are padded to a few sizes, so a
+handful of compilations serve every step. Checkpoints load from Hugging
+Face safetensors (F16, BF16 or F32).
+
+On the emulator, a small random Llama matches a plain f32 reference
+model: logits after a prompt within 3e-4 (relative to the largest), and
+all 19 tokens of a three-sequence continuous-batched generation the
+reference's own greedy choices (`tests/llm.rs`). NVRTC compiles every
+kernel at TinyLlama-1.1B's shapes without register spills. GPU numbers
+against Hugging Face transformers come from `scripts/llm_colab.sh` and
+are not in yet.
 
 ## Usage
 
@@ -85,6 +107,9 @@ cargo build --release
 bash scripts/colab.sh                     # Colab or Kaggle (T4): tests, benchmarks, report
 python3 scripts/pallas_check.py --lower   # TPU kernels, interpret mode (needs jax)
 bash scripts/colab_tpu.sh                 # in Colab (TPU): the same on a TPU, and against XLA
+./target/release/tessel llm-tiny /tmp/tiny && echo '[[1, 5, 9]]' > /tmp/p.json
+./target/release/tessel llm /tmp/tiny --prompts /tmp/p.json --device emu --max-tokens 16 --pages 64
+bash scripts/llm_colab.sh                 # Kaggle or Colab (T4): TinyLlama-1.1B against transformers
 ```
 
 ## License
