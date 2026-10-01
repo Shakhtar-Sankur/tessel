@@ -195,7 +195,18 @@ def main():
                 while k < min(len(x), len(y)) and x[k] == y[k]:
                     k += 1
                 same.append(k)
-            log(a.json, {**base, "kind": "agreement", "prompts": len(same), "max_new": a.max_new,
+            # Where a generation differs: the margin between transformers' top
+            # two logits (fp16) at that token, given the shared history. A
+            # small margin is a near-tie that rounding can tip either way.
+            ties = []
+            for p, x, y, k in zip(ps, t["outputs"], outs, same):
+                if x != y and k < min(len(x), len(y)):
+                    with torch.no_grad():
+                        lg = model(torch.tensor([p + y[:k]], device="cuda")).logits[0, -1].float()
+                    top = torch.topk(lg, 2).values.tolist()
+                    ties.append({"at": k, "tessel": x[k], "transformers": y[k], "top2_margin": top[0] - top[1],
+                                 "logit_gap_between_choices": float(lg[y[k]] - lg[x[k]])})
+            log(a.json, {**base, "kind": "agreement", "prompts": len(same), "max_new": a.max_new, "divergences": ties,
                          "matching_prefix": same, "identical": sum(x == y for x, y in zip(t["outputs"], outs)),
                          "sample_tessel": tok.decode(t["outputs"][0]), "sample_transformers": tok.decode(outs[0])})
 

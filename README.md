@@ -98,31 +98,40 @@ matches Hugging Face transformers' fp32 logits after a chat prompt within
 (`examples/reference_logits.rs`). NVRTC compiles every
 kernel at TinyLlama-1.1B's shapes without register spills.
 
-On a T4 (Kaggle, commit 2fd72a1; raw rows in `bench/t4/`), TinyLlama-1.1B-Chat
-in fp16, greedy, against Hugging Face transformers 5.0 (`generate`, fp16,
-the same prompts):
+On a T4 (Kaggle, commit fa961d7, run 3; raw rows in `bench/t4/`),
+TinyLlama-1.1B-Chat in fp16, greedy, against Hugging Face transformers 5.18
+(`generate`, fp16, the same prompts):
 
 | | tessel | transformers | |
 |---|---|---|---|
-| Logits after a chat prompt, vs transformers in fp32 | within 3.9e-4 of the largest; top 5 the same | | |
-| Greedy generations, 4 prompts, up to 128 tokens | identical to transformers', token for token, all 4 | | |
-| 1 sequence at a time (4 requests) | **85.0 tokens/s** | 32.6 tokens/s | 2.6x |
-| Batches of 8 (32 requests) | **554 tokens/s** | 247 tokens/s | 2.2x |
-| Batches of 32 (32 requests) | **1169 tokens/s** | 970 tokens/s | 1.2x |
+| Logits after a chat prompt, vs transformers in fp32 | within 3.4e-4 of the largest; top 5 the same | | |
+| Greedy generations, 4 prompts, up to 128 tokens | 3 of 4 identical to transformers', token for token; the 4th the same for 18 tokens | | |
+| 1 sequence at a time (4 requests) | **100.1 tokens/s** | 30.6 tokens/s | 3.3x |
+| Batches of 8 (32 requests) | **631 tokens/s** | 252 tokens/s | 2.5x |
+| Batches of 32 (32 requests) | **1231 tokens/s** | 957 tokens/s | 1.3x |
 
 Tokens per second count each engine's own generated tokens over the whole
-run, prompts included (transformers' padded batches end a few tokens
-differently: 3843 against tessel's 3853 at batch 8). transformers'
-`generate` is eager PyTorch, the reference implementation rather than a
-serving engine; vLLM and llama.cpp are the next comparisons. One sequence
-at 85 tokens/s is 11.8 ms a token, against 6.9 ms to read the weights once
-at the T4's 320 GB/s. Replaying each decode step's 200-odd launches as one
-CUDA graph changed little (86.0 against 84.8 tokens/s; run 2,
-`bench/t4/llm_run2_09ce831.jsonl`): the time is in the kernels, not in
-launching them. So the engine now tunes each matmul's tile sizes on the
-GPU the first time it meets a shape, choosing among configurations the
-emulator checks against the interpreter: one decoding token per sequence
-wants many narrow column blocks, so that every SM streams weights.
+run, prompts included. transformers' `generate` is eager PyTorch, the
+reference implementation rather than a serving engine; vLLM and llama.cpp
+are the next comparisons. fp16 generations from two implementations agree
+until rounding tips a near-tie between two tokens; runs 1 and 2 (default
+tiles, transformers 5.0) had all 4 identical.
+
+Where the time goes, one sequence at a time (decode tokens per second):
+
+| | tokens/s | |
+|---|---|---|
+| Default tiles, kernels launched one by one (run 2) | 84.8 | |
+| Default tiles, decode steps replayed as CUDA graphs (run 2) | 86.0 | graphs alone: +1.4% |
+| Tiles tuned on the GPU, launched one by one (run 3) | 92.9 | |
+| Tiles tuned on the GPU, CUDA graphs (run 3) | **100.6** | tuning +19% over the defaults |
+
+At one token per sequence the matmuls only stream weights, and 64-column
+blocks gave a 2048-wide projection 32 blocks for the T4's 40 SMs. The
+engine now times a few tile configurations for each matmul shape on the
+GPU the first time it meets it (every candidate checked against the
+interpreter on the emulator in CI) and keeps the fastest. 100 tokens/s is
+10 ms a token, against 6.9 ms to read the weights once at 320 GB/s.
 
 ## Usage
 

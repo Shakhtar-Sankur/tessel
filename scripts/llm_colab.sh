@@ -34,7 +34,7 @@ step "TinyLlama-1.1B: tessel against transformers"
 OUT=bench/results/llm_runs.jsonl
 mkdir -p bench/results
 : > "$OUT"
-python3 scripts/llm_bench.py --json "$OUT" 2>&1 | grep -v "^Warning\|warn(" | tee -a "$REPORT"
+python3 scripts/llm_bench.py --json "$OUT" 2>&1 | grep -v "^Warning\|warn(\|^\[transformers\] Both" | tee -a "$REPORT"
 
 step "llama.cpp, CUDA build, f16 GGUF (skip with NO_LLAMACPP=1)"
 if [ -z "${NO_LLAMACPP:-}" ]; then
@@ -45,7 +45,10 @@ if [ -z "${NO_LLAMACPP:-}" ]; then
     [ -d $L ] || git clone --quiet --depth 1 https://github.com/ggml-org/llama.cpp $L
     git -C $L log -1 --format='llama.cpp %h %cs'
     nvcc --version | tail -n 1
-    cmake -S $L -B $L/build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release > $L/cmake.log 2>&1 \
+    # GGML_CUDA_NO_VMM: no link against the driver library, which some
+    # toolkits (Kaggle's) lack; it only changes how llama.cpp pools memory.
+    rm -rf $L/build
+    cmake -S $L -B $L/build -DGGML_CUDA=ON -DGGML_CUDA_NO_VMM=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release > $L/cmake.log 2>&1 \
       || { echo "llama.cpp configure failed:"; tail -n 15 $L/cmake.log; exit 0; }
     cmake --build $L/build --target llama-bench llama-batched-bench -j"$(nproc)" > $L/build.log 2>&1 \
       || { echo "llama.cpp build failed:"; grep -i -m 10 "error" $L/build.log; tail -n 5 $L/build.log; exit 0; }
@@ -65,7 +68,7 @@ if [ -z "${NO_VLLM:-}" ]; then
     LOG=bench/results/vllm_install.log
     pip install --quiet uv > $LOG 2>&1
     UV="python3 -m uv"
-    { $UV venv $V --python 3.12 && $UV pip install --python $V/bin/python vllm; } >> $LOG 2>&1
+    { $UV venv --clear $V --python 3.12 && $UV pip install --python $V/bin/python vllm; } >> $LOG 2>&1
     $V/bin/python -c "import vllm, torch; print('vllm', vllm.__version__, 'torch', torch.__version__)" 2>> $LOG \
       || { echo "vLLM install failed:"; grep -v '^\s*$' $LOG | tail -n 15; exit 0; }
     for b in 1 8 32; do
