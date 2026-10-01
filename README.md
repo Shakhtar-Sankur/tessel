@@ -112,10 +112,32 @@ TinyLlama-1.1B-Chat in fp16, greedy, against Hugging Face transformers 5.18
 
 Tokens per second count each engine's own generated tokens over the whole
 run, prompts included. transformers' `generate` is eager PyTorch, the
-reference implementation rather than a serving engine; vLLM and llama.cpp
-are the next comparisons. fp16 generations from two implementations agree
-until rounding tips a near-tie between two tokens; runs 1 and 2 (default
-tiles, transformers 5.0) had all 4 identical.
+reference implementation rather than a serving engine. fp16 generations
+from two implementations agree until rounding tips a tie between two
+tokens: run 4 measured the one place tessel and transformers differ, and
+transformers' own fp16 logits for the two tokens there are exactly equal
+(a margin of 0.0).
+
+Against the serving engines (run 4, commit cc3a29a, the same T4; raw rows
+in `bench/t4/llm_run4_cc3a29a.jsonl`), on the same prompts, greedy, fp16:
+
+| Requests at a time | tessel | vLLM 0.30 | llama.cpp e358d59 (f16 GGUF) |
+|---|---|---|---|
+| 1, generated tokens/s over the run | 93.1 | **105.4** | |
+| 1, decode tokens/s | 93.5 | | **101.0** (batched-bench), 112.1 (llama-bench tg128) |
+| 8, generated tokens/s over the run | 612 | **666** | |
+| 8, decode tokens/s | 662 | | **761** |
+| 32, generated tokens/s over the run | 1186 | **1836** | |
+| 32, decode tokens/s | 1476 | | **2109** |
+
+vLLM's four batch-1 generations are identical to tessel's, token for
+token. tessel is within 12% of vLLM and 7% of llama.cpp one sequence at a
+time (93.1 here against 100.1 in run 3: the T4's clocks vary between
+sessions), 8-13% behind with 8 sequences, and 30-35% behind with 32.
+llama.cpp's batched-bench measures its own workload (64-token prompts, 128
+new tokens each), so its column is a close comparison, not the same one.
+`tessel llm --profile` now reports where each step's time goes, kernel by
+kernel, to close that gap.
 
 Where the time goes, one sequence at a time (decode tokens per second):
 
