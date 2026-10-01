@@ -91,7 +91,11 @@ Face safetensors (F16, BF16 or F32).
 On the emulator, a small random Llama matches a plain f32 reference
 model: logits after a prompt within 3e-4 (relative to the largest), and
 all 19 tokens of a three-sequence continuous-batched generation the
-reference's own greedy choices (`tests/llm.rs`). NVRTC compiles every
+reference's own greedy choices (`tests/llm.rs`). That reference model, on
+TinyLlama-1.1B-Chat's real weights loaded by tessel's safetensors reader,
+matches Hugging Face transformers' fp32 logits after a chat prompt within
+4e-5 (2e-6 of the largest logit), with the same top five tokens
+(`examples/reference_logits.rs`). NVRTC compiles every
 kernel at TinyLlama-1.1B's shapes without register spills. GPU numbers
 against Hugging Face transformers come from `scripts/llm_colab.sh` and
 are not in yet.
