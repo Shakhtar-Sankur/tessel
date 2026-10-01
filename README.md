@@ -157,6 +157,14 @@ quoted here, and a test now checks that packing changes no token) (each prefill 
 32-row tiles among their tuning candidates, so that each weight is read
 once a step instead of once per 16-row block.
 
+Run 7 (commit 64b6f55, before the packing fix, so only its one-prompt-per-
+step numbers count; `bench/t4/llm_run7_64b6f55.jsonl`) measured the 32-row
+tiles: with 32 sequences, tessel's decode rose from 1484 to 1830 tokens/s
+against run 6's 16-row tiles, and the whole run from 1214 to 1525 tokens/s
+against vLLM's 1771 (0.86x, from 0.69x). With 8 sequences, 565 against
+vLLM's 638; one at a time, 98.6 against 73.3, vLLM's generations again
+identical to tessel's.
+
 Where the time goes, one sequence at a time (decode tokens per second):
 
 | | tokens/s | |
