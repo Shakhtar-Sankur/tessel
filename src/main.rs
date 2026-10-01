@@ -25,6 +25,7 @@ usage:
              [--logits OUT]  (also writes the logits after the first prompt, as JSON)
              [--no-graphs]   (launch every decode step's kernels one by one, not as a CUDA graph)
              [--no-tune]     (default matmul tiles instead of tuning them on the GPU)
+             [--profile]     (then runs it all once more timing every kernel launch: time by kernel)
                (greedy generation with the engine of tessel kernels, continuous
                batching over a paged KV cache; MODEL_DIR is a Hugging Face Llama
                checkpoint, FILE a JSON list of token-id lists)
@@ -255,8 +256,30 @@ fn llm(args: &[String]) -> Result<(), String> {
         })
         .collect();
     let ttft: Vec<String> = outs.iter().map(|o| format!("{:.4}", o.first_token_s)).collect();
+    // The same work once more with every launch timed on its own (and
+    // without graphs), after the timed run so it does not change it.
+    let mut prof = String::new();
+    if args.iter().any(|a| a == "--profile") {
+        e.gpu.profile = Some(Default::default());
+        generate(&mut e, &reqs, batch)?;
+        let rows = e.gpu.profile_rows();
+        e.gpu.profile = None;
+        let total: f64 = rows.iter().filter(|r| r.0 == "decode").map(|r| r.3).sum();
+        eprintln!("decode, kernel time by kernel ({total:.1} ms in all, launched one at a time):");
+        let mut items = Vec::new();
+        for (phase, k, n, ms) in &rows {
+            if phase == "decode" {
+                eprintln!("  {:>5.1}%  {ms:>9.2} ms  {n:>6}x  {k}", 100.0 * ms / total.max(1e-9));
+            }
+            items.push(format!(
+                "{{\"phase\": \"{phase}\", \"kernel\": \"{}\", \"launches\": {n}, \"ms\": {ms:.3}}}",
+                k.replace('"', "'")
+            ));
+        }
+        prof = format!(", \"profile\": [{}]", items.join(", "));
+    }
     let line = format!(
-        "{{\"engine\": \"tessel\", \"device\": \"{:?}\", \"requests\": {}, \"batch\": {batch}, \"max_new\": {max_new}, \"prompt_tokens\": {}, \"generated\": {}, \"seconds\": {:.4}, \"tokens_per_s\": {:.2}, \"decode_steps\": {}, \"decode_seconds\": {:.4}, \"decode_tokens_per_s\": {:.2}, \"largest_batch\": {}, \"graphs\": {}, \"load_s\": {load_s:.2}, \"upload_s\": {upload_s:.2}, \"warmup_s\": {warm_s:.2}, \"first_token_s\": [{}], \"outputs\": [{}]}}",
+        "{{\"engine\": \"tessel\", \"device\": \"{:?}\", \"requests\": {}, \"batch\": {batch}, \"max_new\": {max_new}, \"prompt_tokens\": {}, \"generated\": {}, \"seconds\": {:.4}, \"tokens_per_s\": {:.2}, \"decode_steps\": {}, \"decode_seconds\": {:.4}, \"decode_tokens_per_s\": {:.2}, \"largest_batch\": {}, \"graphs\": {}, \"load_s\": {load_s:.2}, \"upload_s\": {upload_s:.2}, \"warmup_s\": {warm_s:.2}, \"first_token_s\": [{}], \"outputs\": [{}]{prof}}}",
         dev,
         reqs.len(),
         st.prompt_tokens,

@@ -168,6 +168,13 @@ def main():
         log(a.json, {**base, "kind": "generate", "engine": "tessel", "batch": b, "requests": len(ps),
                      "generated": t["generated"], "seconds": t["seconds"], "tokens_per_s": t["tokens_per_s"],
                      "decode_tokens_per_s": t["decode_tokens_per_s"], "warmup_s": t["warmup_s"]})
+        if b in (1, 8):
+            # Where tessel's decode time goes, kernel by kernel.
+            pr = tessel(a.tessel, path, ps, a.max_new, b, ["--profile"])
+            dec = [r for r in pr.get("profile", []) if r["phase"] == "decode"]
+            tot = sum(r["ms"] for r in dec) or 1.0
+            log(a.json, {**base, "kind": "profile", "engine": "tessel", "batch": b, "decode_ms": tot,
+                         "kernels": [{**r, "pct": round(100 * r["ms"] / tot, 1)} for r in dec]})
         hf_generate(model, tok, ps[:b], 8, b, eos)  # warm up
         outs, secs = hf_generate(model, tok, ps, a.max_new, b, eos)
         n = sum(len(o) for o in outs)

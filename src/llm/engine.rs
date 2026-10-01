@@ -291,7 +291,9 @@ impl Engine {
             self.gpu.write(self.idx, 0, &bytesi(&ix))?;
         }
         let prefill = matches!(attn, Attn::Prefill);
-        if !prefill && self.graphs && self.gpu.dev == Device::Cuda && bw == Some(t) {
+        self.gpu.phase = if prefill { "prefill" } else { "decode" };
+        // Profiling times every launch on its own, so it runs without graphs.
+        if !prefill && self.graphs && self.gpu.profile.is_none() && self.gpu.dev == Device::Cuda && bw == Some(t) {
             // A decode step of this size: replay its recorded launches, or
             // run them and record them for the next time.
             if let Some(&g) = self.graph.get(&t) {

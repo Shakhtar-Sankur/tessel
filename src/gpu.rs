@@ -35,6 +35,12 @@ pub struct Gpu {
     /// Scalars passed to the emulator live here during a launch.
     scalars: Vec<u128>,
     pub launches: u64,
+    /// When set, every launch waits for its kernel and adds its time here,
+    /// by (phase, kernel): (launches, milliseconds).
+    pub profile: Option<HashMap<(String, String), (u64, f64)>>,
+    /// The phase launches are counted under (prefill or decode).
+    pub phase: &'static str,
+    names: Vec<String>,
 }
 
 /// A compiled kernel of a `Gpu`.
@@ -54,6 +60,9 @@ impl Gpu {
             by_key: HashMap::new(),
             scalars: vec![0; 64],
             launches: 0,
+            profile: None,
+            phase: "",
+            names: Vec::new(),
         })
     }
 
@@ -156,6 +165,8 @@ impl Gpu {
         let k = ir::compile(src, name, &spec)?;
         let c = runtime::compile(&k, self.dev, &Options { warps, arch: 75 })?;
         self.kernels.push(c);
+        let out = shapes.last().map(|s| format!("{s:?}")).unwrap_or_default();
+        self.names.push(format!("{name} -> {out}"));
         self.by_key.insert(key, self.kernels.len() - 1);
         Ok(K(self.kernels.len() - 1))
     }
@@ -184,7 +195,37 @@ impl Gpu {
             });
         }
         self.launches += 1;
-        self.kernels[k.0].launch_raw(&raw)
+        if self.profile.is_none() {
+            return self.kernels[k.0].launch_raw(&raw);
+        }
+        let ms = match self.dev {
+            Device::Cuda => {
+                let kern = &self.kernels[k.0];
+                runtime::cuda()?.time(&mut || kern.launch_raw(&raw))? as f64
+            }
+            Device::Emu => {
+                let t = std::time::Instant::now();
+                self.kernels[k.0].launch_raw(&raw)?;
+                t.elapsed().as_secs_f64() * 1e3
+            }
+        };
+        let key = (self.phase.to_string(), self.names[k.0].clone());
+        let e = self.profile.as_mut().unwrap().entry(key).or_insert((0, 0.0));
+        e.0 += 1;
+        e.1 += ms;
+        Ok(())
+    }
+
+    /// The profile, largest first: (phase, kernel, launches, milliseconds).
+    pub fn profile_rows(&self) -> Vec<(String, String, u64, f64)> {
+        let mut v: Vec<_> = self
+            .profile
+            .iter()
+            .flatten()
+            .map(|((p, k), (n, ms))| (p.clone(), k.clone(), *n, *ms))
+            .collect();
+        v.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap());
+        v
     }
 
     /// Starts recording this device's launches into a CUDA graph instead of
