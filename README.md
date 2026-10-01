@@ -149,7 +149,10 @@ and down projections 32%, the QKV projection 11%, the LM head 6%;
 attention is 3%, norms, rotary embeddings and cache writes together 6%.
 Each matmul streams its weights at 210-240 GB/s, 65-75% of the T4's 320.
 Two changes since target the gap with many sequences: new prompts are
-packed into one prefill step (each prefill step reads every weight, and
+packed into one prefill step (run 6 measured it before a bug was found in
+it: rows of a later prompt could meet a key block wholly masked for them,
+and the softmax turned -inf - -inf into NaN; those runs' speed-ups are not
+quoted here, and a test now checks that packing changes no token) (each prefill step reads every weight, and
 32 prompts took 32 steps), and with 32 sequences the matmuls now have
 32-row tiles among their tuning candidates, so that each weight is read
 once a step instead of once per 16-row block.

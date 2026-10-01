@@ -173,7 +173,9 @@ def main():
             npk = tessel(a.tessel, path, ps, a.max_new, b, ["--no-pack"])
             log(a.json, {**base, "kind": "generate", "engine": "tessel-no-pack", "batch": b, "requests": len(ps),
                          "generated": npk["generated"], "seconds": npk["seconds"], "tokens_per_s": npk["tokens_per_s"],
-                         "decode_tokens_per_s": npk["decode_tokens_per_s"]})
+                         "decode_tokens_per_s": npk["decode_tokens_per_s"],
+                         # Packing must change only the speed, never a token.
+                         "identical_to_packed": sum(x == y for x, y in zip(npk["outputs"], t["outputs"]))})
         if b in (1, 8, 32):
             # Where tessel's decode time goes, kernel by kernel.
             pr = tessel(a.tessel, path, ps, a.max_new, b, ["--profile"])

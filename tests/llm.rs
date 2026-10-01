@@ -185,3 +185,43 @@ fn every_tuning_candidate_is_correct() {
         }
     }
 }
+
+/// Packing prompts into one prefill step changes nothing but speed: a
+/// long and a short prompt, packed so the short one's rows share a 64-row
+/// block with the long one and begin after a whole 64-key block of it,
+/// generate exactly what they generate one prompt per step.
+#[test]
+fn packed_prefill_matches_one_prompt_per_step() {
+    use tessel::llm::sched::generate_with;
+    let cfg = Config::tiny();
+    let w = Weights::random(&cfg, 11);
+    let lim = Limits {
+        page: 8,
+        pages: 64,
+        max_tokens: 128,
+        max_seq_pages: 16,
+    };
+    let long: Vec<i32> = (0..70).map(|i| 1 + (i * 37 % 250)).collect();
+    let short: Vec<i32> = vec![
+        1, 9, 42, 7, 200, 13, 5, 77, 31, 64, 2, 150, 99, 3, 18, 240, 6, 11, 120, 45,
+    ];
+    let reqs = vec![
+        Request {
+            prompt: long,
+            max_new: 4,
+        },
+        Request {
+            prompt: short,
+            max_new: 4,
+        },
+    ];
+    let mut e = Engine::new(Device::Emu, &w, lim.clone()).unwrap();
+    let (packed, st) = generate_with(&mut e, &reqs, 2, true).unwrap();
+    assert_eq!(st.prefill_steps, 1, "both prompts in one step");
+    let mut e = Engine::new(Device::Emu, &w, lim).unwrap();
+    let (single, st) = generate_with(&mut e, &reqs, 2, false).unwrap();
+    assert_eq!(st.prefill_steps, 2);
+    for (a, b) in packed.iter().zip(&single) {
+        assert_eq!(a.tokens, b.tokens);
+    }
+}

@@ -126,7 +126,10 @@ kernel prefill_attention(Q: f16[S, H, D], K: f16[S, G, D], V: f16[S, G, D], star
     # The block's first row has the earliest start.
     st = starts[i : +BM]
     lo = starts[i]
-    m = full([BM], -inf, f32)
+    # The running maximum starts finite: a row's first key blocks can be
+    # wholly masked (before its own prompt begins), and -inf - -inf would
+    # make them NaN instead of contributing nothing.
+    m = full([BM], -1e30, f32)
     l = zeros([BM], f32)
     acc = zeros([BM, D], f32)
     for j in range(lo, minimum(i + BM, S), BN):
