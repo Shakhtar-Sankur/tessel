@@ -168,7 +168,13 @@ def main():
         log(a.json, {**base, "kind": "generate", "engine": "tessel", "batch": b, "requests": len(ps),
                      "generated": t["generated"], "seconds": t["seconds"], "tokens_per_s": t["tokens_per_s"],
                      "decode_tokens_per_s": t["decode_tokens_per_s"], "warmup_s": t["warmup_s"]})
-        if b in (1, 8):
+        if b > 1:
+            # With each prompt in a prefill step of its own: what packing saves.
+            npk = tessel(a.tessel, path, ps, a.max_new, b, ["--no-pack"])
+            log(a.json, {**base, "kind": "generate", "engine": "tessel-no-pack", "batch": b, "requests": len(ps),
+                         "generated": npk["generated"], "seconds": npk["seconds"], "tokens_per_s": npk["tokens_per_s"],
+                         "decode_tokens_per_s": npk["decode_tokens_per_s"]})
+        if b in (1, 8, 32):
             # Where tessel's decode time goes, kernel by kernel.
             pr = tessel(a.tessel, path, ps, a.max_new, b, ["--profile"])
             dec = [r for r in pr.get("profile", []) if r["phase"] == "decode"]

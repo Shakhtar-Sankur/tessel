@@ -113,7 +113,7 @@ kernel kv_write(QKV: f16[T, W], pos: i32[T], slot: i32[T], C: f32[NPOS, D2], S: 
 
 # Causal attention over a prompt, grouped-query: query head h reads key and
 # value head h // (H // G).
-kernel prefill_attention(Q: f16[S, H, D], K: f16[S, G, D], V: f16[S, G, D], O: f16[S, H, D], scale: f32):
+kernel prefill_attention(Q: f16[S, H, D], K: f16[S, G, D], V: f16[S, G, D], starts: i32[S], O: f16[S, H, D], scale: f32):
     meta BM = 64, BN = 64
     grid(cdiv(S, BM), H)
     i = program_id(0) * BM
@@ -121,13 +121,18 @@ kernel prefill_attention(Q: f16[S, H, D], K: f16[S, G, D], V: f16[S, G, D], O: f
     g = h // (H // G)
     q = Q[i : +BM, h, 0 : +D]
     rows = i + arange(BM)
+    # Each row attends causally within its own sequence, which begins at
+    # row starts[row] of the step: several prompts packed into one step.
+    # The block's first row has the earliest start.
+    st = starts[i : +BM]
+    lo = starts[i]
     m = full([BM], -inf, f32)
     l = zeros([BM], f32)
     acc = zeros([BM, D], f32)
-    for j in range(0, minimum(i + BM, S), BN):
+    for j in range(lo, minimum(i + BM, S), BN):
         s = dot(q, trans(K[j : +BN, g, 0 : +D])) * scale
         cols = j + arange(BN)
-        s = where((cols[None, :] <= rows[:, None]) & (cols[None, :] < S), s, -inf)
+        s = where((cols[None, :] <= rows[:, None]) & (cols[None, :] >= st[:, None]) & (cols[None, :] < S), s, -inf)
         m2 = maximum(m, max(s, axis=1))
         p = exp(s - m2[:, None])
         a = exp(m - m2)

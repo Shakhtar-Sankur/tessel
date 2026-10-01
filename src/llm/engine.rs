@@ -35,6 +35,9 @@ pub struct Limits {
 pub enum Attn<'a> {
     /// One sequence's prompt from position 0: causal over the step's tokens.
     Prefill,
+    /// Several prompts packed into the step, each from position 0: row r
+    /// belongs to the sequence whose first row is starts[r].
+    Packed { starts: &'a [i32] },
     /// One token per sequence, against its cache: page tables and lengths
     /// (including the token itself).
     Decode { tables: &'a [Vec<i32>], lens: &'a [i32] },
@@ -73,6 +76,7 @@ pub struct Engine {
     idx: Buf,
     table: Buf,
     lens: Buf,
+    starts: Buf,
 }
 
 fn bytes16(v: &[u16]) -> Vec<u8> {
@@ -182,6 +186,7 @@ impl Engine {
             idx: gpu.alloc(t * 4)?,
             table: gpu.alloc(t * lim.max_seq_pages * 4)?,
             lens: gpu.alloc(t * 4)?,
+            starts: gpu.alloc(t * 4)?,
             gpu,
             graphs: true,
             graph: std::collections::HashMap::new(),
@@ -273,6 +278,17 @@ impl Engine {
         self.gpu.write(self.pos, 0, &bytesi(&ps))?;
         self.gpu.write(self.slot, 0, &bytesi(&sl))?;
         let mp = self.lim.max_seq_pages;
+        // Where each row's sequence begins (padding rows: at themselves).
+        let starts: Option<Vec<i32>> = match &attn {
+            Attn::Prefill => Some(vec![0; n]),
+            Attn::Packed { starts } if starts.len() == n => Some(starts.to_vec()),
+            Attn::Packed { .. } => return Err("packed prefill: one start per token".into()),
+            Attn::Decode { .. } => None,
+        };
+        if let Some(mut st) = starts {
+            st.extend(n as i32..t as i32);
+            self.gpu.write(self.starts, 0, &bytesi(&st))?;
+        }
         if let Attn::Decode { tables, lens } = &attn {
             let mut tb = vec![0i32; t * mp];
             let mut ln = vec![0i32; t];
@@ -290,7 +306,7 @@ impl Engine {
             ix.resize(bw, 0);
             self.gpu.write(self.idx, 0, &bytesi(&ix))?;
         }
-        let prefill = matches!(attn, Attn::Prefill);
+        let prefill = !matches!(attn, Attn::Decode { .. });
         self.gpu.phase = if prefill { "prefill" } else { "decode" };
         // Profiling times every launch on its own, so it runs without graphs.
         if !prefill && self.graphs && self.gpu.profile.is_none() && self.gpu.dev == Device::Cuda && bw == Some(t) {
@@ -384,7 +400,13 @@ impl Engine {
         let att = match prefill {
             true => self.k(
                 "prefill_attention",
-                &[vec![t, nh, hd], vec![t, ng, hd], vec![t, ng, hd], vec![t, nh, hd]],
+                &[
+                    vec![t, nh, hd],
+                    vec![t, ng, hd],
+                    vec![t, ng, hd],
+                    vec![t],
+                    vec![t, nh, hd],
+                ],
                 &[("BM", 64), ("BN", 64)],
                 4,
             )?,
@@ -446,7 +468,10 @@ impl Engine {
                 ],
             )?;
             match prefill {
-                true => g.launch(att, &[B(self.q), B(self.k), B(self.v), B(self.o), F32(scale)])?,
+                true => g.launch(
+                    att,
+                    &[B(self.q), B(self.k), B(self.v), B(self.starts), B(self.o), F32(scale)],
+                )?,
                 false => g.launch(
                     att,
                     &[

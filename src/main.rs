@@ -26,6 +26,7 @@ usage:
              [--no-graphs]   (launch every decode step's kernels one by one, not as a CUDA graph)
              [--no-tune]     (default matmul tiles instead of tuning them on the GPU)
              [--profile]     (then runs it all once more timing every kernel launch: time by kernel)
+             [--no-pack]     (each new prompt in a prefill step of its own, not packed together)
                (greedy generation with the engine of tessel kernels, continuous
                batching over a paged KV cache; MODEL_DIR is a Hugging Face Llama
                checkpoint, FILE a JSON list of token-id lists)
@@ -184,7 +185,7 @@ fn main() {
 fn llm(args: &[String]) -> Result<(), String> {
     use tessel::llm::engine::{Engine, Limits};
     use tessel::llm::safetensors::{Json, load, parse_json};
-    use tessel::llm::sched::{Request, generate};
+    use tessel::llm::sched::{Request, generate_with};
     let dir = args.get(2).ok_or(USAGE)?;
     let num = |k: &str, d: usize| -> Result<usize, String> {
         flag(args, k)
@@ -229,6 +230,7 @@ fn llm(args: &[String]) -> Result<(), String> {
     drop(w);
     let upload_s = t.elapsed().as_secs_f64();
     let batch = num("--batch", 16)?;
+    let pack = !args.iter().any(|a| a == "--no-pack");
     if let Some(p) = flag(args, "--logits") {
         use tessel::llm::engine::Attn;
         let pr = &reqs[0].prompt;
@@ -242,10 +244,10 @@ fn llm(args: &[String]) -> Result<(), String> {
     if args.iter().any(|a| a == "--warmup") {
         // The same work once, so the timed run finds every kernel compiled.
         let t = std::time::Instant::now();
-        generate(&mut e, &reqs, batch)?;
+        generate_with(&mut e, &reqs, batch, pack)?;
         warm_s = t.elapsed().as_secs_f64();
     }
-    let (outs, st) = generate(&mut e, &reqs, batch)?;
+    let (outs, st) = generate_with(&mut e, &reqs, batch, pack)?;
     let ids: Vec<String> = outs
         .iter()
         .map(|o| {
@@ -261,7 +263,7 @@ fn llm(args: &[String]) -> Result<(), String> {
     let mut prof = String::new();
     if args.iter().any(|a| a == "--profile") {
         e.gpu.profile = Some(Default::default());
-        generate(&mut e, &reqs, batch)?;
+        generate_with(&mut e, &reqs, batch, pack)?;
         let rows = e.gpu.profile_rows();
         e.gpu.profile = None;
         let total: f64 = rows.iter().filter(|r| r.0 == "decode").map(|r| r.3).sum();
@@ -279,7 +281,7 @@ fn llm(args: &[String]) -> Result<(), String> {
         prof = format!(", \"profile\": [{}]", items.join(", "));
     }
     let line = format!(
-        "{{\"engine\": \"tessel\", \"device\": \"{:?}\", \"requests\": {}, \"batch\": {batch}, \"max_new\": {max_new}, \"prompt_tokens\": {}, \"generated\": {}, \"seconds\": {:.4}, \"tokens_per_s\": {:.2}, \"decode_steps\": {}, \"decode_seconds\": {:.4}, \"decode_tokens_per_s\": {:.2}, \"largest_batch\": {}, \"graphs\": {}, \"load_s\": {load_s:.2}, \"upload_s\": {upload_s:.2}, \"warmup_s\": {warm_s:.2}, \"first_token_s\": [{}], \"outputs\": [{}]{prof}}}",
+        "{{\"engine\": \"tessel\", \"device\": \"{:?}\", \"requests\": {}, \"batch\": {batch}, \"max_new\": {max_new}, \"prompt_tokens\": {}, \"generated\": {}, \"seconds\": {:.4}, \"tokens_per_s\": {:.2}, \"decode_steps\": {}, \"decode_seconds\": {:.4}, \"decode_tokens_per_s\": {:.2}, \"largest_batch\": {}, \"graphs\": {}, \"packed\": {pack}, \"load_s\": {load_s:.2}, \"upload_s\": {upload_s:.2}, \"warmup_s\": {warm_s:.2}, \"first_token_s\": [{}], \"outputs\": [{}]{prof}}}",
         dev,
         reqs.len(),
         st.prompt_tokens,

@@ -171,7 +171,7 @@ fn llm_kernels_compile_at_tinyllama_shapes() {
             (
                 "prefill_attention",
                 spec(
-                    &[&[t, nh, hd], &[t, ng, hd], &[t, ng, hd], &[t, nh, hd]],
+                    &[&[t, nh, hd], &[t, ng, hd], &[t, ng, hd], &[t], &[t, nh, hd]],
                     &[("BM", 64), ("BN", 64)],
                 ),
                 4,
