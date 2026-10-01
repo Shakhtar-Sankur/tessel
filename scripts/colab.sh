@@ -11,7 +11,7 @@
 #
 # Usage: bash scripts/colab.sh [ROUNDS]
 set -u
-ROUNDS=${1:-3}
+ROUNDS=${1:-4}
 cd "$(dirname "$0")/.."
 REPORT=$PWD/colab_report.txt
 : > "$REPORT"
@@ -38,18 +38,53 @@ step "tests (every kernel on the emulator and on this GPU)"
 cargo test --release 2>&1 | grep -E "^test |test result|panicked|error" | tee -a "$REPORT"
 
 step "benchmark ($ROUNDS rounds; tessel tunes in the first, then reuses its choices)"
+# The T4 throttles as it heats (70 W cap), so which side runs first in a
+# round matters: the order alternates between rounds, every row records
+# its round, and the GPU's clocks are sampled every 200 ms while each side
+# runs (summarized per side in the report).
 OUT=bench/results/gpu_runs.jsonl
 TUNED=bench/results/tuned.txt
+TMP=bench/results/phase.jsonl
 mkdir -p bench/results
 : > "$OUT"
 : > "$TUNED"
-gpu() { nvidia-smi --query-gpu=clocks.sm,clocks.max.sm,power.draw,temperature.gpu --format=csv,noheader 2>&1; }
+phase() { # round, side, command...
+  local r=$1 side=$2
+  shift 2
+  : > "$TMP"
+  nvidia-smi --query-gpu=clocks.sm,power.draw,temperature.gpu --format=csv,noheader,nounits -lms 200 > bench/results/clocks.csv 2> /dev/null &
+  local smi=$!
+  "$@" > /dev/null 2> bench/results/phase.err || echo "round $r: $side failed: $(tail -1 bench/results/phase.err)"
+  kill $smi 2> /dev/null
+  wait $smi 2> /dev/null
+  python3 - "$r" "$side" "$TMP" bench/results/clocks.csv "$OUT" <<'PY'
+import json, statistics, sys
+r, side, tmp, clocks, out = sys.argv[1:]
+c = [l.split(",") for l in open(clocks) if l.count(",") == 2]
+c = [[float(x) for x in l] for l in c if all(x.strip().replace(".", "").isdigit() for x in l)]
+clock = {"round": int(r), "kind": "clocks", "engine": side, "samples": len(c)}
+if c:
+    clock.update(sm_mhz_median=statistics.median(x[0] for x in c), sm_mhz_min=min(x[0] for x in c),
+                 watts_median=statistics.median(x[1] for x in c), temp_c_max=max(x[2] for x in c))
+with open(out, "a") as f:
+    for l in open(tmp):
+        if l.strip():
+            row = json.loads(l)
+            row["round"] = int(r)
+            f.write(json.dumps(row) + "\n")
+    f.write(json.dumps(clock) + "\n")
+print(f"round {r}: {side}: SM clock median {clock.get('sm_mhz_median', '?')} MHz (min {clock.get('sm_mhz_min', '?')}), "
+      f"{clock.get('watts_median', '?')} W, up to {clock.get('temp_c_max', '?')} C, {clock['samples']} samples")
+PY
+}
 for r in $(seq "$ROUNDS"); do
-  log "round $r: GPU (SM MHz, max MHz, W, C) before tessel: $(gpu)"
-  ./target/release/tessel bench --json "$OUT" --tuned "$TUNED" > /dev/null || log "tessel bench failed"
-  log "round $r: GPU before baselines: $(gpu)"
-  python3 scripts/bench_baselines.py --json "$OUT" > /dev/null 2> bench/results/baselines.err || log "baselines failed: $(tail -1 bench/results/baselines.err)"
-  log "round $r done"
+  if [ $((r % 2)) -eq 1 ]; then
+    phase "$r" tessel ./target/release/tessel bench --json "$TMP" --tuned "$TUNED" | tee -a "$REPORT"
+    phase "$r" baselines python3 scripts/bench_baselines.py --json "$TMP" | tee -a "$REPORT"
+  else
+    phase "$r" baselines python3 scripts/bench_baselines.py --json "$TMP" | tee -a "$REPORT"
+    phase "$r" tessel ./target/release/tessel bench --json "$TMP" --tuned "$TUNED" | tee -a "$REPORT"
+  fi
 done
 grep -h '"error"' "$OUT" | head -5 | tee -a "$REPORT"
 

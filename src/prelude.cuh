@@ -413,3 +413,9 @@ KDEV void kstu(khalf *p, unsigned u) { *(unsigned *)p = u; }
 #else
 static inline void kstu(khalf *p, unsigned u) { memcpy(p, &u, 4); }
 #endif
+
+// A matmul operand's place in shared memory: row r, column c (in halves)
+// of a tile with ld halves per row, its 16-byte chunks permuted by XOR with
+// the row (>> sh, masked by m) so 8-row ldmatrix reads and 16-byte stores
+// touch distinct banks without padding.
+KDEV int kswz(int r, int c, int ld, int sh, int m) { return r * ld + ((((c >> 3) ^ ((r >> sh) & m))) << 3) + (c & 7); }

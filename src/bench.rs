@@ -116,7 +116,7 @@ fn attention(r: &mut Rng, h: usize, s: usize, d: usize, quick: bool) -> Case {
         (vec![("BM", 128), ("BN", 32)], 8),
         (vec![("BM", 32), ("BN", 64)], 2),
         (vec![("BM", 128), ("BN", 64)], 4),
-        (vec![("BM", 64), ("BN", 128)], 4),
+        (vec![("BM", 128), ("BN", 128)], 8),
     ];
     if quick {
         configs.truncate(2);
@@ -350,10 +350,16 @@ pub fn run(quick: bool, iters: usize, tuned: Option<&str>, out: &mut dyn FnMut(&
             if dev_args.is_none() {
                 dev_args = Some(c.upload(&case.args)?);
             }
-            let (med, _) = c.time(dev_args.as_ref().unwrap(), 20)?;
-            tried.push(format!("{{\"config\": {}, \"median_ms\": {med:.4}}}", json_str(&name)));
-            if best.as_ref().is_none_or(|b| med < b.0) {
-                best = Some((med, c, name));
+            // Chosen by the fastest of its launches: on a GPU whose clocks
+            // throttle, a slower launch says more about the clocks than the
+            // kernel.
+            let (med, min) = c.time(dev_args.as_ref().unwrap(), 30)?;
+            tried.push(format!(
+                "{{\"config\": {}, \"median_ms\": {med:.4}, \"min_ms\": {min:.4}}}",
+                json_str(&name)
+            ));
+            if best.as_ref().is_none_or(|b| min < b.0) {
+                best = Some((min, c, name));
             }
         }
         let Some((_, c, name)) = best else {

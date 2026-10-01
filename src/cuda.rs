@@ -139,6 +139,20 @@ fn log2(n: usize) -> u32 {
     n.trailing_zeros()
 }
 
+/// The offset (in halves) of row `r`, column `c` of a staged matmul
+/// operand with `ld` halves per row: 16-byte chunks XOR-swizzled within
+/// each 128-byte line of banks (see `kswz` in the prelude). Rows of fewer
+/// than 8 chunks share a line, so the row index is shifted to select it.
+fn swz(r: &str, c: &str, ld: usize) -> String {
+    let chunks = ld / 8;
+    let (sh, m) = if chunks >= 8 {
+        (0, 7)
+    } else {
+        (log2(8 / chunks.max(1)), chunks.max(1) - 1)
+    };
+    format!("kswz({r}, {c}, {ld}, {sh}, {m})")
+}
+
 fn strides(dims: &[usize]) -> Vec<usize> {
     let mut s = vec![1; dims.len()];
     for i in (0..dims.len().saturating_sub(1)).rev() {
@@ -1420,7 +1434,7 @@ impl<'a> G<'a> {
                 let mut k = 0;
                 while k < nr {
                     let (r, c) = self.rc(id, k);
-                    let at = format!("{s} + {r} * {ld} + {c}");
+                    let at = format!("{s} + {}", swz(&r.to_string(), &c.to_string(), ld));
                     if v == 8 {
                         let w: Vec<String> = (0..4).map(|j| format!("{name}[{}]", k / 2 + j)).collect();
                         self.line(&format!("kst16({at}, {});", w.join(", ")));
@@ -1435,7 +1449,8 @@ impl<'a> G<'a> {
             None => {
                 for k in 0..nr {
                     let (r, c) = self.rc(id, k);
-                    self.line(&format!("{s}[{r} * {ld} + {c}] = kf2h({name}[{k}]);"));
+                    let at = swz(&r.to_string(), &c.to_string(), ld);
+                    self.line(&format!("{s}[{at}] = kf2h({name}[{k}]);"));
                 }
             }
         }
@@ -1493,14 +1508,22 @@ impl<'a> G<'a> {
                             ));
                         }
                         (None, Some((sa, lda, true))) => self.line(&format!(
-                            "kldm4t(&fa[{}], {sa} + ({kk} + (lane >> 4) * 8 + (lane & 7)) * {lda} + r0 + {} + ((lane >> 3) & 1) * 8);",
+                            "kldm4t(&fa[{}], {sa} + {});",
                             4 * mi,
-                            mi * 16
+                            swz(
+                                &format!("{kk} + (lane >> 4) * 8 + (lane & 7)"),
+                                &format!("r0 + {} + ((lane >> 3) & 1) * 8", mi * 16),
+                                *lda
+                            )
                         )),
                         (None, Some((sa, lda, false))) => self.line(&format!(
-                            "kldm4(&fa[{}], {sa} + (r0 + {} + (lane & 15)) * {lda} + {kk} + (lane >> 4) * 8);",
+                            "kldm4(&fa[{}], {sa} + {});",
                             4 * mi,
-                            mi * 16
+                            swz(
+                                &format!("r0 + {} + (lane & 15)", mi * 16),
+                                &format!("{kk} + (lane >> 4) * 8"),
+                                *lda
+                            )
                         )),
                         _ => unreachable!(),
                     }
@@ -1509,28 +1532,29 @@ impl<'a> G<'a> {
                 while ni < nn {
                     let pair = ni + 1 < nn;
                     let n0 = ni * 8;
-                    let (f, addr) = match (btr, pair) {
+                    let (f, r, c) = match (btr, pair) {
                         (false, true) => (
                             "kldm4t",
-                            format!(
-                                "{sb} + ({kk} + ((lane >> 3) & 1) * 8 + (lane & 7)) * {ldb} + c0 + {n0} + (lane >> 4) * 8"
-                            ),
+                            format!("{kk} + ((lane >> 3) & 1) * 8 + (lane & 7)"),
+                            format!("c0 + {n0} + (lane >> 4) * 8"),
                         ),
                         (false, false) => (
                             "kldm2t",
-                            format!("{sb} + ({kk} + ((lane >> 3) & 1) * 8 + (lane & 7)) * {ldb} + c0 + {n0}"),
+                            format!("{kk} + ((lane >> 3) & 1) * 8 + (lane & 7)"),
+                            format!("c0 + {n0}"),
                         ),
                         (true, true) => (
                             "kldm4",
-                            format!(
-                                "{sb} + (c0 + {n0} + (lane >> 4) * 8 + (lane & 7)) * {ldb} + {kk} + ((lane >> 3) & 1) * 8"
-                            ),
+                            format!("c0 + {n0} + (lane >> 4) * 8 + (lane & 7)"),
+                            format!("{kk} + ((lane >> 3) & 1) * 8"),
                         ),
                         (true, false) => (
                             "kldm2",
-                            format!("{sb} + (c0 + {n0} + (lane & 7)) * {ldb} + {kk} + ((lane >> 3) & 1) * 8"),
+                            format!("c0 + {n0} + (lane & 7)"),
+                            format!("{kk} + ((lane >> 3) & 1) * 8"),
                         ),
                     };
+                    let addr = format!("{sb} + {}", swz(&r, &c, ldb));
                     self.line(&format!("{f}(&fb[{}], {addr});", 2 * ni));
                     ni += if pair { 2 } else { 1 };
                 }
@@ -1662,7 +1686,7 @@ impl<'a> G<'a> {
         } else {
             (t.shape[0], t.shape[1])
         };
-        let ld = c + 8;
+        let ld = c;
         let bytes = (r * ld * 2).next_multiple_of(16);
         let s = self.fresh("S");
         match self.loops.last().cloned() {

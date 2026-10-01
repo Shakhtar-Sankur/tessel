@@ -17,6 +17,7 @@ Usage: python scripts/bench_baselines.py [--quick] [--iters 30] [--json OUT]
 import argparse
 import glob
 import json
+import time
 import math
 import os
 import shutil
@@ -41,8 +42,14 @@ except Exception:  # noqa: BLE001
 
 
 def bench(fn, iters):
-    for _ in range(3):
+    # Warm up for at least 50 ms of launches (and 3), so the clocks have
+    # ramped up after any idle time; tessel's timing does the same.
+    t, n = time.perf_counter(), 0
+    while n < 3 or time.perf_counter() - t < 0.05:
         fn()
+        n += 1
+        if n % 8 == 0:
+            torch.cuda.synchronize()
     torch.cuda.synchronize()
     ts = []
     for _ in range(iters):

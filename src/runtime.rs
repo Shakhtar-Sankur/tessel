@@ -88,7 +88,12 @@ pub fn compile(k: &Kernel, dev: Device, o: &Options) -> Result<Compiled, String>
             let bin = cubin(&code.source, o.arch)?;
             let f = c.load(&bin, std::slice::from_ref(&code.name))?[0];
             if code.smem > 48 * 1024 {
-                c.allow_smem(f, code.smem as u32)?;
+                c.allow_smem(f, code.smem as u32).map_err(|_| {
+                    format!(
+                        "needs {} KB of shared memory, more than this GPU allows a block",
+                        code.smem.div_ceil(1024)
+                    )
+                })?;
             }
             Exec::Cuda(f)
         }
@@ -242,8 +247,17 @@ impl Compiled {
     /// Median and minimum milliseconds of `iters` launches (after warmup).
     pub fn time(&self, d: &DeviceArgs, iters: usize) -> Result<(f64, f64), String> {
         let c = cuda()?;
-        for _ in 0..3 {
+        // Warm up for at least 50 ms of launches (and 3), so the clocks have
+        // ramped up after any idle time (compiling, say); the baselines'
+        // timing does the same.
+        let t = std::time::Instant::now();
+        let mut n = 0;
+        while n < 3 || t.elapsed().as_millis() < 50 {
             self.launch(d)?;
+            n += 1;
+            if n % 8 == 0 {
+                c.sync()?;
+            }
         }
         c.sync()?;
         let mut ts = Vec::new();
