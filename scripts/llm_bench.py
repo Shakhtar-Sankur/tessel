@@ -81,6 +81,17 @@ def tessel(exe, model, prompts, max_new, batch, extra=()):
         return json.loads(open(o).read())
 
 
+def load_model(path, dtype):
+    """The model on the GPU; newer transformers call the argument dtype."""
+    from transformers import AutoModelForCausalLM
+
+    try:
+        m = AutoModelForCausalLM.from_pretrained(path, dtype=dtype)
+    except TypeError:
+        m = AutoModelForCausalLM.from_pretrained(path, torch_dtype=dtype)
+    return m.to(dtype).cuda().eval()
+
+
 def hf_generate(model, tok, prompts, max_new, batch, eos):
     """Greedy generation in left-padded batches; (outputs, seconds)."""
     outs = []
@@ -114,13 +125,19 @@ def main():
     ap.add_argument("--json")
     a = ap.parse_args()
     from huggingface_hub import snapshot_download
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoTokenizer
 
     path = snapshot_download(a.model, allow_patterns=["*.json", "*.safetensors", "tokenizer*"])
     tok = AutoTokenizer.from_pretrained(path)
     if tok.pad_token_id is None:
         tok.pad_token_id = tok.eos_token_id
-    prompts = [tok.apply_chat_template([{"role": "user", "content": q}], add_generation_prompt=True) for q in QUESTIONS]
+    # The chat template as text, then its tokens: plain lists of ints on any
+    # transformers version (newer ones return a BatchEncoding when asked to
+    # tokenize). The template holds its own special tokens.
+    prompts = []
+    for q in QUESTIONS:
+        text = tok.apply_chat_template([{"role": "user", "content": q}], tokenize=False, add_generation_prompt=True)
+        prompts.append([int(x) for x in tok(text, add_special_tokens=False)["input_ids"]])
     eos = tok.eos_token_id
     dev = torch.cuda.get_device_name(0)
     base = {"device": dev, "model": a.model}
@@ -129,7 +146,7 @@ def main():
     t_out = tessel(a.tessel, path, prompts[:1], 1, 1,
                    ["--logits", os.path.join(tempfile.gettempdir(), "tessel_logits.json")])
     ours = np.array(json.load(open(os.path.join(tempfile.gettempdir(), "tessel_logits.json"))), np.float64)
-    m32 = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.float32).cuda().eval()
+    m32 = load_model(path, torch.float32)
     with torch.no_grad():
         ref = m32(torch.tensor([prompts[0]], device="cuda")).logits[0, -1].double().cpu().numpy()
     del m32
@@ -140,7 +157,7 @@ def main():
                  "top1_same": bool(ours.argmax() == ref.argmax()), "top5_overlap": top5})
 
     # 2. Throughput and generations.
-    model = AutoModelForCausalLM.from_pretrained(path, torch_dtype=torch.float16).cuda().eval()
+    model = load_model(path, torch.float16)
     for b in [int(x) for x in a.batches.split(",")]:
         ps = prompts[:4] if b == 1 else prompts
         t = tessel(a.tessel, path, ps, a.max_new, b)
