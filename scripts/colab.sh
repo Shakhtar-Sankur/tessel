@@ -4,6 +4,9 @@
 # benchmarks tessel's kernels against cuBLAS, PyTorch and Triton, and writes
 # everything to colab_report.txt (printed at the end).
 #
+# On Kaggle, the same cell works in a notebook with Accelerator "GPU T4 x2"
+# and Internet on (it uses the first GPU).
+#
 # In Colab (Runtime > Change runtime type > T4 GPU), one cell:
 #   !git clone https://github.com/Shakhtar-Sankur/tessel && cd tessel && bash scripts/colab.sh
 # Again in the same session:
