@@ -36,31 +36,6 @@ mkdir -p bench/results
 : > "$OUT"
 python3 scripts/llm_bench.py --json "$OUT" 2>&1 | grep -v "^Warning\|warn(\|^\[transformers\] Both" | tee -a "$REPORT"
 
-step "llama.cpp, CUDA build, f16 GGUF (skip with NO_LLAMACPP=1)"
-if [ -z "${NO_LLAMACPP:-}" ]; then
-  (
-    export PATH=/usr/local/cuda/bin:$PATH
-    command -v nvcc > /dev/null || { echo "llama.cpp skipped: no nvcc (CUDA toolkit) on this machine"; exit 0; }
-    L=/tmp/llama.cpp
-    [ -d $L ] || git clone --quiet --depth 1 https://github.com/ggml-org/llama.cpp $L
-    git -C $L log -1 --format='llama.cpp %h %cs'
-    nvcc --version | tail -n 1
-    # GGML_CUDA_NO_VMM: no link against the driver library, which some
-    # toolkits (Kaggle's) lack; it only changes how llama.cpp pools memory.
-    rm -rf $L/build
-    cmake -S $L -B $L/build -DGGML_CUDA=ON -DGGML_CUDA_NO_VMM=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release > $L/cmake.log 2>&1 \
-      || { echo "llama.cpp configure failed:"; tail -n 15 $L/cmake.log; exit 0; }
-    cmake --build $L/build --target llama-bench llama-batched-bench -j"$(nproc)" > $L/build.log 2>&1 \
-      || { echo "llama.cpp build failed:"; grep -i -m 10 "error" $L/build.log; tail -n 5 $L/build.log; exit 0; }
-    pip install --quiet $L/gguf-py sentencepiece > /dev/null 2>&1
-    MODEL=$(python3 -c "import json; print(json.load(open('bench/results/llm_prompts.json'))['path'])")
-    python3 $L/convert_hf_to_gguf.py "$MODEL" --outtype f16 --outfile /tmp/model-f16.gguf > $L/convert.log 2>&1 \
-      || { echo "GGUF conversion failed:"; tail -n 10 $L/convert.log; exit 0; }
-    python3 scripts/llamacpp_bench.py --bin $L/build/bin --gguf /tmp/model-f16.gguf --json "$OUT" \
-      || echo "llama.cpp benchmark failed"
-  ) 2>&1 | tee -a "$REPORT"
-fi
-
 step "vLLM on the same prompts (its own environment; skip with NO_VLLM=1)"
 if [ -z "${NO_VLLM:-}" ]; then
   (
@@ -75,6 +50,40 @@ if [ -z "${NO_VLLM:-}" ]; then
       timeout 1200 $V/bin/python scripts/vllm_bench.py --batch "$b" --json "$OUT" 2> bench/results/vllm.err | grep '^{' \
         || { echo "vLLM batch $b failed:"; grep -v '^\s*$' bench/results/vllm.err | tail -n 8; }
     done
+  ) 2>&1 | tee -a "$REPORT"
+fi
+
+step "llama.cpp, CUDA build, f16 GGUF (skip with NO_LLAMACPP=1)"
+if [ -z "${NO_LLAMACPP:-}" ]; then
+  (
+    export PATH=/usr/local/cuda/bin:$PATH
+    command -v nvcc > /dev/null || { echo "llama.cpp skipped: no nvcc (CUDA toolkit) on this machine"; exit 0; }
+    L=/tmp/llama.cpp
+    [ -d $L ] || git clone --quiet --depth 1 https://github.com/ggml-org/llama.cpp $L
+    git -C $L log -1 --format='llama.cpp %h %cs'
+    nvcc --version | tail -n 1
+    # GGML_CUDA_NO_VMM: no link against the driver library, which some
+    # toolkits (Kaggle's) lack; it only changes how llama.cpp pools memory.
+    # A build from earlier in the same session is reused.
+    if [ ! -x $L/build/bin/llama-batched-bench ]; then
+    rm -rf $L/build
+    cmake -S $L -B $L/build -DGGML_CUDA=ON -DGGML_CUDA_NO_VMM=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DLLAMA_CURL=OFF -DCMAKE_BUILD_TYPE=Release > $L/cmake.log 2>&1 \
+      || { echo "llama.cpp configure failed:"; tail -n 15 $L/cmake.log; exit 0; }
+    echo "compiling llama.cpp's CUDA kernels: 30-60 minutes on a few CPU cores; progress every minute"
+    cmake --build $L/build --target llama-bench llama-batched-bench -j"$(nproc)" > $L/build.log 2>&1 &
+    BUILD=$!
+    while kill -0 $BUILD 2> /dev/null; do
+      sleep 60
+      echo "  $(date +%H:%M) $(grep -o '^\[ *[0-9]*%\]' $L/build.log | tail -n 1) $(grep -c 'Building CUDA' $L/build.log) CUDA files compiled"
+    done
+    wait $BUILD || { echo "llama.cpp build failed:"; grep -i -m 10 "error" $L/build.log; tail -n 5 $L/build.log; exit 0; }
+    fi
+    pip install --quiet $L/gguf-py sentencepiece > /dev/null 2>&1
+    MODEL=$(python3 -c "import json; print(json.load(open('bench/results/llm_prompts.json'))['path'])")
+    python3 $L/convert_hf_to_gguf.py "$MODEL" --outtype f16 --outfile /tmp/model-f16.gguf > $L/convert.log 2>&1 \
+      || { echo "GGUF conversion failed:"; tail -n 10 $L/convert.log; exit 0; }
+    python3 scripts/llamacpp_bench.py --bin $L/build/bin --gguf /tmp/model-f16.gguf --json "$OUT" \
+      || echo "llama.cpp benchmark failed"
   ) 2>&1 | tee -a "$REPORT"
 fi
 
