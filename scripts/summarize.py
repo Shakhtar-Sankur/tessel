@@ -69,15 +69,21 @@ def main(path):
     for n in notes[-1:]:
         print(f"Triton {n['triton_version']}: its matmul PTX ({n['matmul_ptx_files']} files) "
               + ("uses" if n["matmul_uses_mma"] else "does NOT use") + " tensor-core mma instructions on this GPU.\n")
+    mhz = defaultdict(list)
+    for r in rows:
+        if r.get("sm_mhz"):
+            mhz[r["engine"]].append(r["sm_mhz"])
+    if mhz:
+        print("SM clock read right after each engine's timed launches (median over its rows, MHz):")
+        print(", ".join(f"{NAMES.get(e, e)} {statistics.median(v):.0f} (lowest {min(v)})" for e, v in mhz.items()) + "\n")
     clocks = [json.loads(l) for l in open(path) if l.strip() and '"clocks"' in l]
     clocks = [c for c in clocks if c.get("samples")]
     if clocks:
-        print("GPU clocks while each side ran (median of the rounds' medians; 200 ms samples):")
+        print("GPU sampled every 200 ms over each side's whole run, idle gaps (compiling, checking) included:")
         for side in ("tessel", "baselines"):
             cs = [c for c in clocks if c["engine"] == side]
             if cs:
-                print(f"- {side}: SM {statistics.median(c['sm_mhz_median'] for c in cs):.0f} MHz "
-                      f"(lowest sample {min(c['sm_mhz_min'] for c in cs):.0f}), "
+                print(f"- {side}: SM {statistics.median(c['sm_mhz_median'] for c in cs):.0f} MHz median, "
                       f"{statistics.median(c['watts_median'] for c in cs):.1f} W, up to {max(c['temp_c_max'] for c in cs):.0f} C")
         print()
     tuned = {}

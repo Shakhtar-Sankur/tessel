@@ -41,11 +41,34 @@ except Exception:  # noqa: BLE001
     triton = None
 
 
+def _nvml():
+    """The SM clock reader of NVML (device 0), or None."""
+    try:
+        import ctypes
+
+        lib = ctypes.CDLL("libnvidia-ml.so.1")
+        dev = ctypes.c_void_p()
+        if lib.nvmlInit_v2() != 0 or lib.nvmlDeviceGetHandleByIndex_v2(0, ctypes.byref(dev)) != 0:
+            return None
+
+        def read():
+            v = ctypes.c_uint()
+            return v.value if lib.nvmlDeviceGetClockInfo(dev, 1, ctypes.byref(v)) == 0 else None
+
+        return read
+    except Exception:
+        return None
+
+
+SM_MHZ = _nvml()
+LAST_MHZ = None
+
+
 def bench(fn, iters):
-    # Warm up for at least 50 ms of launches (and 3), so the clocks have
+    # Warm up for at least 200 ms of launches (and 3), so the clocks have
     # ramped up after any idle time; tessel's timing does the same.
     t, n = time.perf_counter(), 0
-    while n < 3 or time.perf_counter() - t < 0.05:
+    while n < 3 or time.perf_counter() - t < 0.2:
         fn()
         n += 1
         if n % 8 == 0:
@@ -60,6 +83,9 @@ def bench(fn, iters):
         b.record()
         b.synchronize()
         ts.append(a.elapsed_time(b))
+    # The clock the timed launches ran at (read before the GPU idles down).
+    global LAST_MHZ
+    LAST_MHZ = SM_MHZ() if SM_MHZ else None
     ts.sort()
     return ts[len(ts) // 2], ts[0]
 
@@ -183,7 +209,7 @@ def main():
     def emit(kind, label, engine, med, mn, err, flops, nbytes, note=""):
         r = {"kind": kind, "label": label, "engine": engine, "device": dev, "median_ms": round(med, 4), "min_ms": round(mn, 4),
              "tflops": round(flops / (med * 1e-3) / 1e12, 3) if flops else 0.0, "gbps": round(nbytes / (med * 1e-3) / 1e9, 1),
-             "rel_err": err, "config": note}
+             "rel_err": err, "sm_mhz": LAST_MHZ, "config": note}
         line = json.dumps(r)
         print(line, flush=True)
         if out:

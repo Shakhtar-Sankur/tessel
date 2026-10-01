@@ -8,8 +8,13 @@ base64. `python3 scripts/summarize.py FILE` turns a file into the tables.
 |---|---|---|---|
 | run1_fa918eb.jsonl | fa918eb | 2 | tessel ran before the baselines in every round |
 | run2_3966b0e.jsonl | 3966b0e | 3 | as run 1; in round 1 tessel also tuned, on a GPU still at idle clocks |
+| run3_c7ab694.jsonl | c7ab694 | 4 | Kaggle T4; swizzled staging; order alternating; rows carry their round, and clock samples per side |
 
-These runs predate round tags in the rows: in both, each round wrote the
-tessel rows and then the baseline rows, in order. From the next run on,
-rows carry their round, the order alternates between rounds, and the
-GPU's clocks are recorded while each side runs.
+Runs 1 and 2 predate round tags in the rows: in both, each round wrote
+the tessel rows and then the baseline rows, in order. From run 3 on, rows
+carry their round and the order alternates between rounds. Run 3's
+"clocks" rows sample the GPU every 200 ms over each side's whole run,
+which is mostly idle time between timed loops (compiling, checking
+results), so they read far below the clock the timed launches ran at;
+later runs also record, in every row, the SM clock read right after its
+timed launches.

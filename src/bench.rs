@@ -381,6 +381,9 @@ pub fn run(quick: bool, iters: usize, tuned: Option<&str>, out: &mut dyn FnMut(&
         }
         // The chosen configuration, timed again with more launches.
         let (med, min) = c.time(dev_args.as_ref().unwrap(), iters)?;
+        let mhz = runtime::sm_mhz()
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| "null".into());
         let d = c.upload(&case.args)?;
         c.launch(&d)?;
         let mut got = case.args.clone();
@@ -393,7 +396,7 @@ pub fn run(quick: bool, iters: usize, tuned: Option<&str>, out: &mut dyn FnMut(&
         };
         let gbps = case.bytes / (med * 1e-3) / 1e9;
         out(&format!(
-            "{{\"kind\": {}, \"label\": {}, \"engine\": \"tessel\", \"device\": {}, \"median_ms\": {med:.4}, \"min_ms\": {min:.4}, \"tflops\": {tflops:.3}, \"gbps\": {gbps:.1}, \"rel_err\": {err:.3e}, \"config\": {}, \"tried\": [{}]}}",
+            "{{\"kind\": {}, \"label\": {}, \"engine\": \"tessel\", \"device\": {}, \"median_ms\": {med:.4}, \"min_ms\": {min:.4}, \"tflops\": {tflops:.3}, \"gbps\": {gbps:.1}, \"rel_err\": {err:.3e}, \"sm_mhz\": {mhz}, \"config\": {}, \"tried\": [{}]}}",
             json_str(case.kind),
             json_str(&case.label),
             json_str(&cuda.name),

@@ -89,7 +89,13 @@ for r in $(seq "$ROUNDS"); do
     phase "$r" tessel ./target/release/tessel bench --json "$TMP" --tuned "$TUNED" | tee -a "$REPORT"
   fi
 done
-grep -h '"error"' "$OUT" | head -5 | tee -a "$REPORT"
+python3 -c "
+import json, sys
+for l in open('$OUT'):
+    r = json.loads(l)
+    if 'error' in r:
+        print(l.strip())
+" | head -5 | tee -a "$REPORT"
 
 step "summary"
 python3 scripts/summarize.py "$OUT" 2>&1 | tee -a "$REPORT"

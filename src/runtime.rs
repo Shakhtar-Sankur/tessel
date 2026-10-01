@@ -36,6 +36,13 @@ const EMU_FLAGS: &[&str] = &["-O1", "-std=c++17", "-fPIC", "-shared", "-pthread"
 
 static CUDA: OnceLock<Result<Cuda, String>> = OnceLock::new();
 static NVRTC: OnceLock<Result<Nvrtc, String>> = OnceLock::new();
+static NVML: OnceLock<Option<crate::driver::Nvml>> = OnceLock::new();
+
+/// The GPU's SM clock now, in MHz, where NVML is available. Read right
+/// after timed launches, it is the clock they ran at.
+pub fn sm_mhz() -> Option<u32> {
+    NVML.get_or_init(|| crate::driver::Nvml::open().ok()).as_ref()?.sm_mhz()
+}
 
 /// The GPU, opened once per process.
 pub fn cuda() -> Result<&'static Cuda, String> {
@@ -188,6 +195,46 @@ impl Compiled {
         }
     }
 
+    /// Launches with raw arguments, one per parameter: on the GPU, device
+    /// pointers for arrays and the bits of scalars (asynchronously, on the
+    /// current stream); on the emulator, host addresses for both (scalars
+    /// point at their bytes), and the call returns when the kernel has run.
+    pub fn launch_raw(&self, args: &[u64]) -> Result<(), String> {
+        if args.len() != self.kernel.params.len() {
+            return Err(format!(
+                "{}: {} arguments for {} parameters",
+                self.kernel.name,
+                args.len(),
+                self.kernel.params.len()
+            ));
+        }
+        let g = &self.code;
+        match &self.exec {
+            Exec::Emu(f, _) => {
+                let mut ptrs: Vec<*mut f32> = args.iter().map(|&a| a as usize as *mut f32).collect();
+                // SAFETY: the caller passes live buffers of the kernel's shapes.
+                unsafe {
+                    f(
+                        ptrs.as_mut_ptr(),
+                        g.grid[0] as u32,
+                        g.grid[1] as u32,
+                        g.grid[2] as u32,
+                        g.threads as u32,
+                        g.smem as u32,
+                    )
+                };
+                Ok(())
+            }
+            Exec::Cuda(f) => cuda()?.launch(
+                *f,
+                [g.grid[0] as u32, g.grid[1] as u32, g.grid[2] as u32],
+                g.threads as u32,
+                g.smem as u32,
+                args,
+            ),
+        }
+    }
+
     pub fn upload(&self, args: &[Tensor]) -> Result<DeviceArgs, String> {
         let c = cuda()?;
         let mut ptrs = Vec::new();
@@ -247,12 +294,12 @@ impl Compiled {
     /// Median and minimum milliseconds of `iters` launches (after warmup).
     pub fn time(&self, d: &DeviceArgs, iters: usize) -> Result<(f64, f64), String> {
         let c = cuda()?;
-        // Warm up for at least 50 ms of launches (and 3), so the clocks have
+        // Warm up for at least 200 ms of launches (and 3), so the clocks have
         // ramped up after any idle time (compiling, say); the baselines'
         // timing does the same.
         let t = std::time::Instant::now();
         let mut n = 0;
-        while n < 3 || t.elapsed().as_millis() < 50 {
+        while n < 3 || t.elapsed().as_millis() < 200 {
             self.launch(d)?;
             n += 1;
             if n % 8 == 0 {

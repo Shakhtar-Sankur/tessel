@@ -485,3 +485,39 @@ impl Nvrtc {
         }
     }
 }
+
+/// NVML (the driver's management library), for the GPU's current SM clock.
+pub struct Nvml {
+    dev: *mut c_void,
+    get_clock: unsafe extern "C" fn(*mut c_void, c_int, *mut c_uint) -> c_int,
+}
+
+// SAFETY: NVML handles may be used from any thread.
+unsafe impl Send for Nvml {}
+unsafe impl Sync for Nvml {}
+
+impl Nvml {
+    /// NVML for device 0.
+    #[allow(non_snake_case)]
+    pub fn open() -> Result<Nvml, String> {
+        let h = open(&["libnvidia-ml.so.1".into(), "libnvidia-ml.so".into()]).ok_or("no NVML")?;
+        let nvmlInit: unsafe extern "C" fn() -> c_int = sym(h, "nvmlInit_v2")?;
+        let byIndex: unsafe extern "C" fn(c_uint, *mut *mut c_void) -> c_int = sym(h, "nvmlDeviceGetHandleByIndex_v2")?;
+        let mut dev = std::ptr::null_mut();
+        // SAFETY: plain calls with a valid out-pointer.
+        if unsafe { nvmlInit() } != 0 || unsafe { byIndex(0, &mut dev) } != 0 {
+            return Err("NVML has no device 0".into());
+        }
+        Ok(Nvml {
+            dev,
+            get_clock: sym(h, "nvmlDeviceGetClockInfo")?,
+        })
+    }
+
+    /// The SM clock now, in MHz.
+    pub fn sm_mhz(&self) -> Option<u32> {
+        let mut v: c_uint = 0;
+        // SAFETY: valid handle and out-pointer; 1 is NVML_CLOCK_SM.
+        (unsafe { (self.get_clock)(self.dev, 1, &mut v) } == 0).then_some(v)
+    }
+}
