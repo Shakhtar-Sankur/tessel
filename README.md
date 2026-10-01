@@ -96,9 +96,27 @@ TinyLlama-1.1B-Chat's real weights loaded by tessel's safetensors reader,
 matches Hugging Face transformers' fp32 logits after a chat prompt within
 4e-5 (2e-6 of the largest logit), with the same top five tokens
 (`examples/reference_logits.rs`). NVRTC compiles every
-kernel at TinyLlama-1.1B's shapes without register spills. GPU numbers
-against Hugging Face transformers come from `scripts/llm_colab.sh` and
-are not in yet.
+kernel at TinyLlama-1.1B's shapes without register spills.
+
+On a T4 (Kaggle, commit 2fd72a1; raw rows in `bench/t4/`), TinyLlama-1.1B-Chat
+in fp16, greedy, against Hugging Face transformers 5.0 (`generate`, fp16,
+the same prompts):
+
+| | tessel | transformers | |
+|---|---|---|---|
+| Logits after a chat prompt, vs transformers in fp32 | within 3.9e-4 of the largest; top 5 the same | | |
+| Greedy generations, 4 prompts, up to 128 tokens | identical to transformers', token for token, all 4 | | |
+| 1 sequence at a time (4 requests) | **85.0 tokens/s** | 32.6 tokens/s | 2.6x |
+| Batches of 8 (32 requests) | **554 tokens/s** | 247 tokens/s | 2.2x |
+| Batches of 32 (32 requests) | **1169 tokens/s** | 970 tokens/s | 1.2x |
+
+Tokens per second count each engine's own generated tokens over the whole
+run, prompts included (transformers' padded batches end a few tokens
+differently: 3843 against tessel's 3853 at batch 8). transformers'
+`generate` is eager PyTorch, the reference implementation rather than a
+serving engine; vLLM and llama.cpp are the next comparisons. One sequence
+at 85 tokens/s is 11.8 ms a token, against 6.9 ms to read the weights once
+at the T4's 320 GB/s.
 
 ## Usage
 
