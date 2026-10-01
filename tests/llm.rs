@@ -115,7 +115,7 @@ fn every_tuning_candidate_is_correct() {
     let src = tessel::kernels::source("llm").unwrap();
     let mut r = Rng::new(5);
     let (k, n) = (256usize, 96usize);
-    for m in [16usize, 64] {
+    for m in [16usize, 32, 64] {
         let cases: Vec<(&str, Vec<Tensor>, bool)> = vec![
             (
                 "linear",

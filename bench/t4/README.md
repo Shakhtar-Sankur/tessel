@@ -12,6 +12,7 @@ base64. `python3 scripts/summarize.py FILE` turns a file into the tables.
 | llm_run2_09ce831.jsonl | 09ce831 | 1 | Kaggle T4; decode steps as CUDA graphs, and the same without (tessel-no-graphs) |
 | llm_run3_fa961d7.jsonl | fa961d7 | 1 | Kaggle T4; matmul tiles tuned on the GPU, with and without (tessel-no-tune) |
 | llm_run4_cc3a29a.jsonl | cc3a29a | 1 | Kaggle T4; also vLLM 0.30 and llama.cpp e358d59 (llama-bench, llama-batched-bench) |
+| llm_run5_2fd5039.jsonl | 2fd5039 | 1 | Kaggle T4; vLLM again, and per-kernel decode profiles at batch 1 and 8 |
 | run3_c7ab694.jsonl | c7ab694 | 4 | Kaggle T4; swizzled staging; order alternating; rows carry their round, and clock samples per side |
 
 Runs 1 and 2 predate round tags in the rows: in both, each round wrote

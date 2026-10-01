@@ -136,8 +136,23 @@ time (93.1 here against 100.1 in run 3: the T4's clocks vary between
 sessions), 8-13% behind with 8 sequences, and 30-35% behind with 32.
 llama.cpp's batched-bench measures its own workload (64-token prompts, 128
 new tokens each), so its column is a close comparison, not the same one.
-`tessel llm --profile` now reports where each step's time goes, kernel by
-kernel, to close that gap.
+In run 5 (commit 2fd5039, another session) one sequence at a time
+tessel ran 97.9 tokens/s against vLLM's 84.8, with vLLM's generations
+again identical to tessel's; with 8 sequences 602 against 648, with 32
+1207 against 1819 (`bench/t4/llm_run5_2fd5039.jsonl`). Between sessions
+the T4 alone moves these numbers by 10% or more, so one sequence at a
+time the two are level; with many sequences vLLM leads.
+
+`tessel llm --profile` times every kernel launch. One sequence at a time
+(run 5), 91% of decode time is the four matmuls: gate_up 42%, the output
+and down projections 32%, the QKV projection 11%, the LM head 6%;
+attention is 3%, norms, rotary embeddings and cache writes together 6%.
+Each matmul streams its weights at 210-240 GB/s, 65-75% of the T4's 320.
+Two changes since target the gap with many sequences: new prompts are
+packed into one prefill step (each prefill step reads every weight, and
+32 prompts took 32 steps), and with 32 sequences the matmuls now have
+32-row tiles among their tuning candidates, so that each weight is read
+once a step instead of once per 16-row block.
 
 Where the time goes, one sequence at a time (decode tokens per second):
 

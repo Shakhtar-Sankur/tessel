@@ -99,8 +99,9 @@ pub fn padded(n: usize) -> usize {
 
 /// Tile configurations a matmul with `m` rows is tuned over on the GPU, the
 /// default first. One decoding token per sequence leaves the matmuls bound
-/// by reading the weights, which wants many narrow column blocks (more
-/// blocks than SMs); prompts want large tiles. `two`: gate_up, which keeps
+/// by reading the weights, which wants every row in one row block (so each
+/// weight is read once) and many narrow column blocks (more blocks than
+/// SMs); prompts want large tiles. `two`: gate_up, which keeps
 /// two accumulators and so takes at most 64 columns.
 pub fn mm_candidates(m: usize, two: bool) -> Vec<(Vec<(&'static str, i64)>, usize)> {
     let c = |bm: i64, bn: i64, bk: i64, w: usize| (vec![("BM", bm), ("BN", bn), ("BK", bk)], w);
@@ -115,6 +116,24 @@ pub fn mm_candidates(m: usize, two: bool) -> Vec<(Vec<(&'static str, i64)>, usiz
                 c(128, 64, 32, 4),
             ]
         }
+    } else if m >= 32 {
+        // One row block covering every row, so each weight is read once a
+        // step (16-row blocks read it twice); the 16-row tiles stay as
+        // candidates.
+        let mut v = vec![
+            c(32, 64, 64, 4),
+            c(32, 32, 64, 4),
+            c(32, 32, 128, 4),
+            c(32, 64, 128, 4),
+            c(32, 16, 128, 2),
+            c(16, 64, 64, 4),
+            c(16, 32, 128, 4),
+        ];
+        // gate_up's two accumulators spill registers at this one.
+        if !two {
+            v.push(c(32, 16, 256, 2));
+        }
+        v
     } else {
         vec![
             c(16, 64, 64, 4),
