@@ -100,3 +100,88 @@ fn checkpoints_round_trip() {
     let j = parse_json(r#"{"a": [1, -2.5e3, true, null], "b": "x\"é😀y"}"#).unwrap();
     assert_eq!(j.get("b").unwrap().str(), Some("x\"é😀y"));
 }
+
+/// Every tile configuration the engine's GPU tuner may pick, for each of
+/// its matmul kernels, at a decode size and a prompt size: the emulator
+/// against the interpreter.
+#[test]
+fn every_tuning_candidate_is_correct() {
+    use tessel::ast::DType;
+    use tessel::bench::Rng;
+    use tessel::cuda::Options;
+    use tessel::interp::{self, Tensor};
+    use tessel::ir::{Spec, compile};
+    use tessel::llm::engine::mm_candidates;
+    let src = tessel::kernels::source("llm").unwrap();
+    let mut r = Rng::new(5);
+    let (k, n) = (256usize, 96usize);
+    for m in [16usize, 64] {
+        let cases: Vec<(&str, Vec<Tensor>, bool)> = vec![
+            (
+                "linear",
+                vec![
+                    r.tensor(DType::F16, &[m, k], 1.0),
+                    r.tensor(DType::F16, &[n, k], 0.1),
+                    Tensor::zeros(DType::F16, &[m, n]),
+                ],
+                false,
+            ),
+            (
+                "linear_residual",
+                vec![
+                    r.tensor(DType::F16, &[m, k], 1.0),
+                    r.tensor(DType::F16, &[n, k], 0.1),
+                    r.tensor(DType::F32, &[m, n], 1.0),
+                ],
+                false,
+            ),
+            (
+                "logits",
+                vec![
+                    r.tensor(DType::F16, &[m, k], 1.0),
+                    r.tensor(DType::F16, &[n, k], 0.1),
+                    Tensor::zeros(DType::F32, &[m, n]),
+                ],
+                false,
+            ),
+            (
+                "gate_up",
+                vec![
+                    r.tensor(DType::F16, &[m, k], 1.0),
+                    r.tensor(DType::F16, &[n, k], 0.1),
+                    r.tensor(DType::F16, &[n, k], 0.1),
+                    Tensor::zeros(DType::F16, &[m, n]),
+                ],
+                true,
+            ),
+        ];
+        for (name, args, two) in cases {
+            let shapes: Vec<Vec<usize>> = args.iter().map(|t| t.shape.clone()).collect();
+            for (meta, warps) in mm_candidates(m, two) {
+                let spec = Spec {
+                    shapes: shapes.clone(),
+                    meta: meta.iter().map(|(a, b)| (a.to_string(), *b)).collect(),
+                };
+                let kern = compile(src, name, &spec).unwrap();
+                let mut want = args.clone();
+                interp::run(&kern, &mut want).unwrap();
+                let c = tessel::runtime::compile(&kern, tessel::runtime::Device::Emu, &Options { warps, arch: 75 })
+                    .unwrap_or_else(|e| panic!("{name} {meta:?} w{warps}: {e}"));
+                let mut got = args.clone();
+                c.run(&mut got).unwrap();
+                let out = got.len() - 1;
+                let scale = want[out].data.iter().map(|x| x.abs()).fold(0f32, f32::max);
+                let err = got[out]
+                    .data
+                    .iter()
+                    .zip(&want[out].data)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(
+                    err <= 1e-2 * scale,
+                    "{name} m={m} {meta:?} w{warps}: error {err} of {scale}"
+                );
+            }
+        }
+    }
+}

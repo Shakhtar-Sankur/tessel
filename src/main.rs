@@ -24,6 +24,7 @@ usage:
              [--page 16] [--pages 1024] [--max-tokens 1024] [--warmup] [--json OUT]
              [--logits OUT]  (also writes the logits after the first prompt, as JSON)
              [--no-graphs]   (launch every decode step's kernels one by one, not as a CUDA graph)
+             [--no-tune]     (default matmul tiles instead of tuning them on the GPU)
                (greedy generation with the engine of tessel kernels, continuous
                batching over a paged KV cache; MODEL_DIR is a Hugging Face Llama
                checkpoint, FILE a JSON list of token-id lists)
@@ -223,6 +224,7 @@ fn llm(args: &[String]) -> Result<(), String> {
     let t = std::time::Instant::now();
     let mut e = Engine::new(dev, &w, lim)?;
     e.graphs = !args.iter().any(|a| a == "--no-graphs");
+    e.tune = !args.iter().any(|a| a == "--no-tune");
     drop(w);
     let upload_s = t.elapsed().as_secs_f64();
     let batch = num("--batch", 16)?;

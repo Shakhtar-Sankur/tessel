@@ -180,6 +180,11 @@ def main():
             log(a.json, {**base, "kind": "generate", "engine": "tessel-no-graphs", "batch": b, "requests": len(ps),
                          "generated": ng["generated"], "seconds": ng["seconds"], "tokens_per_s": ng["tokens_per_s"],
                          "decode_tokens_per_s": ng["decode_tokens_per_s"]})
+            # And with the default matmul tiles: what tuning them on the GPU gains.
+            nt = tessel(a.tessel, path, ps, a.max_new, b, ["--no-tune"])
+            log(a.json, {**base, "kind": "generate", "engine": "tessel-no-tune", "batch": b, "requests": len(ps),
+                         "generated": nt["generated"], "seconds": nt["seconds"], "tokens_per_s": nt["tokens_per_s"],
+                         "decode_tokens_per_s": nt["decode_tokens_per_s"]})
             if a.json:
                 with open(os.path.join(os.path.dirname(a.json) or ".", "llm_tessel_outputs.json"), "w") as f:
                     json.dump(t["outputs"], f)

@@ -45,6 +45,9 @@ pub struct Engine {
     /// Replay decode steps as CUDA graphs (one launch instead of hundreds).
     pub graphs: bool,
     graph: std::collections::HashMap<usize, GraphExec>,
+    /// Tune matmul tile sizes on the GPU at first use (else the defaults).
+    pub tune: bool,
+    tuned: std::collections::HashMap<String, K>,
     pub cfg: Config,
     pub lim: Limits,
     embed: Buf,
@@ -90,13 +93,33 @@ pub fn padded(n: usize) -> usize {
     n.max(16).next_power_of_two()
 }
 
-/// Tile sizes for a matmul with `m` rows (`two` for gate_up's pair of
-/// accumulators, which needs half the columns to stay in registers).
-fn mm_meta(m: usize, two: bool) -> (Vec<(&'static str, i64)>, usize) {
+/// Tile configurations a matmul with `m` rows is tuned over on the GPU, the
+/// default first. One decoding token per sequence leaves the matmuls bound
+/// by reading the weights, which wants many narrow column blocks (more
+/// blocks than SMs); prompts want large tiles. `two`: gate_up, which keeps
+/// two accumulators and so takes at most 64 columns.
+pub fn mm_candidates(m: usize, two: bool) -> Vec<(Vec<(&'static str, i64)>, usize)> {
+    let c = |bm: i64, bn: i64, bk: i64, w: usize| (vec![("BM", bm), ("BN", bn), ("BK", bk)], w);
     if m >= 64 {
-        (vec![("BM", 64), ("BN", if two { 64 } else { 128 }), ("BK", 32)], 4)
+        if two {
+            vec![c(64, 64, 32, 4), c(128, 64, 32, 4), c(64, 32, 32, 4)]
+        } else {
+            vec![
+                c(64, 128, 32, 4),
+                c(64, 64, 32, 4),
+                c(128, 128, 32, 4),
+                c(128, 64, 32, 4),
+            ]
+        }
     } else {
-        (vec![("BM", 16), ("BN", 64), ("BK", 64)], 4)
+        vec![
+            c(16, 64, 64, 4),
+            c(16, 32, 64, 4),
+            c(16, 32, 128, 4),
+            c(16, 64, 128, 4),
+            c(16, 16, 128, 2),
+            c(16, 16, 256, 2),
+        ]
     }
 }
 
@@ -162,6 +185,8 @@ impl Engine {
             gpu,
             graphs: true,
             graph: std::collections::HashMap::new(),
+            tune: true,
+            tuned: std::collections::HashMap::new(),
             cfg,
             lim,
             embed,
@@ -175,6 +200,49 @@ impl Engine {
 
     fn k(&mut self, name: &str, shapes: &[Vec<usize>], meta: &[(&str, i64)], warps: usize) -> Result<K, String> {
         self.gpu.kernel("llm", name, shapes, meta, warps)
+    }
+
+    /// Matmul kernel `name` for these shapes. On the GPU, the first time,
+    /// each candidate tile configuration is timed on `args` (the engine's
+    /// own buffers; anything it writes, the step rewrites) and the fastest
+    /// kept; elsewhere, or with tuning off, the default.
+    fn mm(&mut self, name: &str, shapes: &[Vec<usize>], two: bool, args: &[Arg]) -> Result<K, String> {
+        let key = format!("{name} {shapes:?}");
+        if let Some(&k) = self.tuned.get(&key) {
+            return Ok(k);
+        }
+        let cands = mm_candidates(shapes[0][0], two);
+        let pick = if self.gpu.dev != Device::Cuda || !self.tune {
+            self.k(name, shapes, &cands[0].0, cands[0].1)?
+        } else {
+            let c = crate::runtime::cuda()?;
+            let mut best: Option<(f32, K, String)> = None;
+            for (meta, w) in &cands {
+                let Ok(k) = self.k(name, shapes, meta, *w) else {
+                    continue;
+                };
+                let g = &mut self.gpu;
+                let warm = (0..3).try_for_each(|_| g.launch(k, args));
+                let ms = warm.and_then(|_| {
+                    c.time(&mut || {
+                        for _ in 0..10 {
+                            g.launch(k, args)?;
+                        }
+                        Ok(())
+                    })
+                });
+                if let Ok(ms) = ms
+                    && best.as_ref().is_none_or(|b| ms < b.0)
+                {
+                    best = Some((ms, k, format!("{meta:?} warps {w}")));
+                }
+            }
+            let (ms, k, desc) = best.ok_or_else(|| format!("{key}: no configuration ran"))?;
+            eprintln!("tessel: tuned {key}: {desc}, {:.1} us", ms * 100.0);
+            k
+        };
+        self.tuned.insert(key, pick);
+        Ok(pick)
     }
 
     /// Runs the decoder over `tokens` at positions `pos`, writing their keys
@@ -258,8 +326,6 @@ impl Engine {
         let ns = self.lim.pages * self.lim.page;
         let mp = self.lim.max_seq_pages;
         let bc = dm.next_power_of_two() as i64;
-        let (mm, mw) = mm_meta(t, false);
-        let (gm, gw) = mm_meta(t, true);
         let scale = 1.0 / (hd as f32).sqrt();
         let eps = cfg.eps;
 
@@ -270,7 +336,20 @@ impl Engine {
             4,
         )?;
         let norm = self.k("rmsnorm", &[vec![t, dm], vec![dm], vec![t, dm]], &[("BC", bc)], 4)?;
-        let qkv = self.k("linear", &[vec![t, dm], vec![w, dm], vec![t, w]], &mm, mw)?;
+        use Arg::Buf as AB;
+        let l0 = (
+            self.layers[0].wqkv,
+            self.layers[0].wo,
+            self.layers[0].wg,
+            self.layers[0].wu,
+            self.layers[0].wd,
+        );
+        let qkv = self.mm(
+            "linear",
+            &[vec![t, dm], vec![w, dm], vec![t, w]],
+            false,
+            &[AB(self.h), AB(l0.0), AB(self.qkv)],
+        )?;
         let npos = cfg.max_pos;
         let rope = self.k(
             "rope_q",
@@ -324,14 +403,24 @@ impl Engine {
                 )?
             }
         };
-        let oproj = self.k(
+        let oproj = self.mm(
             "linear_residual",
             &[vec![t, nh * hd], vec![dm, nh * hd], vec![t, dm]],
-            &mm,
-            mw,
+            false,
+            &[AB(self.o), AB(l0.1), AB(self.x)],
         )?;
-        let gu = self.k("gate_up", &[vec![t, dm], vec![f, dm], vec![f, dm], vec![t, f]], &gm, gw)?;
-        let down = self.k("linear_residual", &[vec![t, f], vec![dm, f], vec![t, dm]], &mm, mw)?;
+        let gu = self.mm(
+            "gate_up",
+            &[vec![t, dm], vec![f, dm], vec![f, dm], vec![t, f]],
+            true,
+            &[AB(self.h), AB(l0.2), AB(l0.3), AB(self.mlp)],
+        )?;
+        let down = self.mm(
+            "linear_residual",
+            &[vec![t, f], vec![dm, f], vec![t, dm]],
+            false,
+            &[AB(self.mlp), AB(l0.4), AB(self.x)],
+        )?;
 
         let g = &mut self.gpu;
         use Arg::{Buf as B, F32};
@@ -375,14 +464,18 @@ impl Engine {
             g.launch(down, &[B(self.mlp), B(l.wd), B(self.x)])?;
         }
         let Some(bw) = bw else { return Ok(()) };
-        let (lm, lw) = mm_meta(bw, false);
         let fin = self.k(
             "rmsnorm_rows",
             &[vec![t, dm], vec![bw], vec![dm], vec![bw, dm]],
             &[("BC", bc)],
             4,
         )?;
-        let head = self.k("logits", &[vec![bw, dm], vec![v, dm], vec![bw, v]], &lm, lw)?;
+        let head = self.mm(
+            "logits",
+            &[vec![bw, dm], vec![v, dm], vec![bw, v]],
+            false,
+            &[Arg::Buf(self.last), Arg::Buf(self.head), Arg::Buf(self.logits)],
+        )?;
         let g = &mut self.gpu;
         g.launch(fin, &[B(self.x), B(self.idx), B(self.norm), B(self.last), F32(eps)])?;
         g.launch(head, &[B(self.last), B(self.head), B(self.logits)])?;

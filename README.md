@@ -116,7 +116,13 @@ differently: 3843 against tessel's 3853 at batch 8). transformers'
 `generate` is eager PyTorch, the reference implementation rather than a
 serving engine; vLLM and llama.cpp are the next comparisons. One sequence
 at 85 tokens/s is 11.8 ms a token, against 6.9 ms to read the weights once
-at the T4's 320 GB/s.
+at the T4's 320 GB/s. Replaying each decode step's 200-odd launches as one
+CUDA graph changed little (86.0 against 84.8 tokens/s; run 2,
+`bench/t4/llm_run2_09ce831.jsonl`): the time is in the kernels, not in
+launching them. So the engine now tunes each matmul's tile sizes on the
+GPU the first time it meets a shape, choosing among configurations the
+emulator checks against the interpreter: one decoding token per sequence
+wants many narrow column blocks, so that every SM streams weights.
 
 ## Usage
 
