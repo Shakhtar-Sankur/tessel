@@ -1,0 +1,17 @@
+[package]
+name = "tessel"
+version = "0.1.0"
+edition = "2024"
+description = "A tile language for GPU kernels, compiled to CUDA, Metal and TPU (Pallas)"
+license = "Apache-2.0"
+
+[dependencies]
+
+[profile.release]
+debug = false
+codegen-units = 1
+lto = "fat"
+panic = "abort"
+
+[profile.test]
+opt-level = 3

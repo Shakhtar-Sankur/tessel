@@ -1,0 +1,26 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --release --all-targets -- -D warnings
+      - name: NVRTC, to compile the CUDA kernels without a GPU
+        run: |
+          pip install --quiet nvidia-cuda-nvrtc-cu12
+          echo "TESSEL_NVRTC=$(python3 -c 'import nvidia.cuda_nvrtc, os; print(os.path.join(nvidia.cuda_nvrtc.__path__[0], "lib", "libnvrtc.so.12"))')" >> "$GITHUB_ENV"
+      - name: tests (the interpreter; every kernel's CUDA on the emulator; NVRTC for sm_75 and sm_80)
+        run: cargo test --release
