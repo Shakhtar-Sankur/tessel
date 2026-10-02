@@ -50,10 +50,12 @@ cores), and `examples/metal_cases.rs` writes 19 cases (each kernel in
 `kernels/`, the LLM engine's among them, with inputs) that CI checks three
 ways: run on the emulator against the interpreter, type-checked by clang
 against a stand-in for Metal's standard library with real address spaces
-(`scripts/metal_syntax.sh`), and compiled by Apple's compiler on a macOS
-runner, which also runs them on the GPU with `scripts/metal_run.swift`
-and checks every output where the runner has a Metal device. Nothing has
-been timed on Apple hardware.
+(`scripts/metal_syntax.sh`), and compiled by Apple's compiler (`xcrun
+metal`) on a macOS runner, where all 19 compile. GitHub's macOS runners
+have no Metal device, so none has yet run on an Apple GPU:
+`scripts/metal_run.swift` does that on a Mac (and in CI, should a runner
+have one), and `metal_cases check` compares every output with the
+interpreter. Nothing has been timed on Apple hardware.
 
 Kernels so far: `kernels/` (matmul, FlashAttention, paged decode
 attention, softmax, RMSNorm, and the LLM engine's: embedding, fused QKV
