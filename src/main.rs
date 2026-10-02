@@ -7,11 +7,13 @@ use tessel::interp::{self, Tensor};
 use tessel::ir::{self, Spec};
 use tessel::runtime::{self, Device};
 
-const USAGE: &str = "tessel: a tile language for GPU and TPU kernels
+const USAGE: &str = "tessel: a tile language for GPU and TPU kernels (CUDA, Metal, Pallas)
 
 usage:
   tessel ir    FILE KERNEL --shapes 128x64,64x32,128x32 [--meta BM=64,BN=64]
   tessel cuda  FILE KERNEL --shapes ... [--meta ...] [--warps 4]
+  tessel metal FILE KERNEL --shapes ... [--meta ...] [--warps 4]
+               (the kernel for Apple GPUs, in the Metal Shading Language)
   tessel pallas FILE KERNEL --shapes ... [--meta ...]
                (the kernel for TPUs, as a Python module using Pallas)
   tessel run   FILE KERNEL --shapes ... [--meta ...] [--warps 4] [--device emu|cuda]
@@ -87,7 +89,7 @@ fn main() {
         .map(|w| w.parse().unwrap_or_else(|_| die("bad --warps")))
         .unwrap_or(4);
     match cmd {
-        "ir" | "cuda" | "pallas" | "run" => {
+        "ir" | "cuda" | "metal" | "pallas" | "run" => {
             if args.len() < 4 {
                 die(USAGE);
             }
@@ -95,6 +97,18 @@ fn main() {
             let k = ir::compile(&src, &args[3], &spec(&args)).unwrap_or_else(|e| die(&e));
             match cmd {
                 "ir" => print!("{}", ir::dump(&k)),
+                "metal" => {
+                    let o = Options {
+                        warps,
+                        arch: tessel::cuda::METAL,
+                    };
+                    let g = generate(&k, &o).unwrap_or_else(|e| die(&e));
+                    print!("{}", g.metal.unwrap());
+                    eprintln!(
+                        "grid {:?}, {} threads per threadgroup, {} bytes of threadgroup memory",
+                        g.grid, g.threads, g.smem
+                    );
+                }
                 "pallas" => print!("{}", tessel::pallas::generate(&k).unwrap_or_else(|e| die(&e))),
                 "cuda" => {
                     let g = generate(&k, &Options { warps, arch: 75 }).unwrap_or_else(|e| die(&e));

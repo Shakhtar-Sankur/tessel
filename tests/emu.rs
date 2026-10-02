@@ -6,15 +6,18 @@ mod common;
 
 use common::*;
 use tessel::ast::DType;
-use tessel::cuda::Options;
+use tessel::cuda::{METAL, Options};
 use tessel::interp::{Tensor, run};
 use tessel::ir::{Spec, compile};
 use tessel::runtime::{self, Device};
 
-fn devices() -> Vec<Device> {
-    let mut d = vec![Device::Emu];
+/// Where each kernel runs: the emulator with the CUDA code generator's
+/// choices and with the Metal ones (no tensor cores; the same kernel body
+/// as the Metal source), and the GPU when there is one.
+fn targets() -> Vec<(Device, u32)> {
+    let mut d = vec![(Device::Emu, 75), (Device::Emu, METAL)];
     if runtime::cuda().is_ok() {
-        d.push(Device::Cuda);
+        d.push((Device::Cuda, 75));
     }
     d
 }
@@ -35,22 +38,23 @@ fn check(file: &str, name: &str, args: &[Tensor], metas: &[(&[(&str, i64)], usiz
         let k = compile(&src(file), name, &spec).unwrap();
         let mut want = args.to_vec();
         run(&k, &mut want).unwrap();
-        for dev in devices() {
-            let c = runtime::compile(
-                &k,
-                dev,
-                &Options {
-                    warps: *warps,
-                    arch: 75,
-                },
-            )
-            .unwrap_or_else(|e| panic!("{name} {meta:?} warps {warps}: {e}"));
+        for (dev, arch) in targets() {
+            let c = match runtime::compile(&k, dev, &Options { warps: *warps, arch }) {
+                Ok(c) => c,
+                // Metal gives a threadgroup 32 KB: larger tiles are refused.
+                Err(e) if arch == METAL && e.contains("threadgroup memory") => continue,
+                Err(e) => panic!("{name} {meta:?} warps {warps}: {e}"),
+            };
+            if arch == METAL {
+                let m = c.code.metal.as_ref().expect("Metal source");
+                assert!(m.contains("kernel void") && !m.contains("mma") && !m.contains("long long"));
+            }
             let mut got = args.to_vec();
             c.run(&mut got).unwrap_or_else(|e| panic!("{name}: {e}"));
             for (i, (g, w)) in got.iter().zip(&want).enumerate() {
                 if !g.shape.is_empty() {
                     assert_close(
-                        &format!("{name} {meta:?} warps {warps} {dev:?} arg {i}"),
+                        &format!("{name} {meta:?} warps {warps} {dev:?} arch {arch} arg {i}"),
                         &g.data,
                         &w.data,
                         tol,

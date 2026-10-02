@@ -28,3 +28,36 @@ jobs:
         run: |
           pip install --quiet "jax==0.10.2" numpy
           python3 scripts/pallas_check.py --lower
+      - name: Metal backend (every case on the emulator as generated for Metal, against the interpreter; type-checked with clang)
+        run: |
+          cargo run --release --example metal_cases -- write metal-out
+          cargo run --release --example metal_cases -- emu metal-out
+          cargo run --release --example metal_cases -- check metal-out
+          scripts/metal_syntax.sh metal-out
+
+  # Apple's own compiler for every Metal case, then, where the runner has a
+  # Metal device, each run on the GPU and checked against the interpreter.
+  metal:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo run --release --example metal_cases -- write metal-out
+      - name: compile with xcrun metal
+        run: |
+          for f in metal-out/*/kernel.metal; do
+            xcrun -sdk macosx metal -fno-fast-math -c "$f" -o "${f%.metal}.air"
+          done
+          echo "$(ls metal-out/*/kernel.air | wc -l) kernels compiled"
+      - name: run on the GPU and check
+        run: |
+          set +e
+          swift scripts/metal_run.swift metal-out
+          s=$?
+          set -e
+          if [ "$s" = 3 ]; then
+            echo "::warning::no Metal device on this runner: the kernels compiled but did not run"
+            exit 0
+          fi
+          [ "$s" = 0 ]
+          cargo run --release --example metal_cases -- check metal-out

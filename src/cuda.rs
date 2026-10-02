@@ -23,13 +23,19 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write;
 
 pub const PRELUDE: &str = include_str!("prelude.cuh");
+/// The same helpers in the Metal Shading Language.
+pub const METAL_PRELUDE: &str = include_str!("prelude.metal");
 
 #[derive(Clone, Debug)]
 pub struct Options {
     pub warps: usize,
-    /// sm_75 (Turing, the T4) or sm_80 and newer.
+    /// sm_75 (Turing, the T4) or sm_80 and newer; or `METAL` (0) for
+    /// Apple GPUs, where matmuls run on the SIMT path.
     pub arch: u32,
 }
+
+/// `Options::arch` for Metal.
+pub const METAL: u32 = 0;
 
 impl Default for Options {
     fn default() -> Self {
@@ -39,6 +45,9 @@ impl Default for Options {
 
 #[derive(Clone, Debug)]
 pub struct Generated {
+    /// For `METAL`: the kernel in the Metal Shading Language (`source` is
+    /// then the same kernel for the emulator).
+    pub metal: Option<String>,
     pub name: String,
     pub source: String,
     pub threads: usize,
@@ -187,6 +196,9 @@ impl<'a> G<'a> {
     fn acc_layout(&mut self, shape: &[usize], dt: DType) -> usize {
         let (bm, bn) = (shape[0], shape[1]);
         let w = self.o.warps;
+        // Tensor-core fragments (mma.sync) are NVIDIA's: Metal takes the
+        // SIMT path.
+        let dt = if self.o.arch == METAL { DType::F32 } else { dt };
         if dt == DType::F16 && self.rowwise && bm / w >= 16 && bm.is_multiple_of(w) {
             let l = Layout::mma(shape, w, 1);
             let id = self.lid(l, 3);
@@ -1044,7 +1056,7 @@ impl<'a> G<'a> {
         let mut cond = Vec::new();
         let mut sl = Vec::new();
         for (d, (size, e, v)) in ix.iter().enumerate() {
-            base.push(format!("(long long)({e}) * {}", st[d]));
+            base.push(format!("(KI64)({e}) * {}", st[d]));
             match size {
                 None => {
                     if !self.in_bounds(*v, 1, dims[d]) {
@@ -1055,7 +1067,7 @@ impl<'a> G<'a> {
             }
         }
         let b = self.fresh("o");
-        self.line(&format!("const long long {b} = {};", base.join(" + ")));
+        self.line(&format!("const KI64 {b} = {};", base.join(" + ")));
         let c = self.fresh("m");
         self.line(&format!(
             "const bool {c} = {};",
@@ -1597,9 +1609,9 @@ impl<'a> G<'a> {
             let base = self.alloc(bytes_a + bk * ldb * 4);
             let (sa, sb) = (self.fresh("As"), self.fresh("Bs"));
             self.line("KSYNC();");
-            self.line(&format!("float *{sa} = (float *)(tsmem + TSO_DOT + {base});"));
+            self.line(&format!("TSP float *{sa} = (TSP float *)(tsmem + TSO_DOT + {base});"));
             self.line(&format!(
-                "float *{sb} = (float *)(tsmem + TSO_DOT + {});",
+                "TSP float *{sb} = (TSP float *)(tsmem + TSO_DOT + {});",
                 base + bytes_a
             ));
             for k in 0..self.layouts[la].nregs() {
@@ -1693,12 +1705,12 @@ impl<'a> G<'a> {
             Some(par) => {
                 let off = self.alloc(2 * bytes);
                 self.line(&format!(
-                    "khalf *{s} = (khalf *)(tsmem + TSO_DOT + {off} + {par} * {bytes});"
+                    "TSP khalf *{s} = (TSP khalf *)(tsmem + TSO_DOT + {off} + {par} * {bytes});"
                 ));
             }
             None => {
                 let off = self.alloc(bytes);
-                self.line(&format!("khalf *{s} = (khalf *)(tsmem + TSO_DOT + {off});"));
+                self.line(&format!("TSP khalf *{s} = (TSP khalf *)(tsmem + TSO_DOT + {off});"));
             }
         }
         let v = if raw { Some(self.raw[&self.raw_src(x)]) } else { None };
@@ -1831,7 +1843,7 @@ impl<'a> G<'a> {
                 for (k, ix) in idx.iter().enumerate() {
                     let Ix::Point(x) = ix else { unreachable!() };
                     let e = self.sexpr(*x, iv, ive, defs);
-                    off.push(format!("(long long)({e}) * {}", st[k]));
+                    off.push(format!("(KI64)({e}) * {}", st[k]));
                     cond.push(format!("(unsigned)({e}) < {}u", dims[k]));
                 }
                 let p = format!("a{arr}[{}]", off.join(" + "));
@@ -2008,8 +2020,12 @@ pub fn generate(k: &Kernel, o: &Options) -> Result<Generated, String> {
         }
     }
     let _ = writeln!(src, "KGLOBAL({threads}) {name}({}) {{", params.join(", "));
-    src.push_str("  SMEM;\n  float *tsf = (float *)tsmem;\n  int *tsi = (int *)tsmem;\n  (void)tsf;\n  (void)tsi;\n");
-    src.push_str("  const int lane = (int)threadIdx.x & 31, warp = (int)threadIdx.x >> 5;\n  const int g = lane >> 2, t = lane & 3;\n  (void)g;\n  (void)t;\n  (void)warp;\n");
+    let scratch_ptrs =
+        "  TSP float *tsf = (TSP float *)tsmem;\n  TSP int *tsi = (TSP int *)tsmem;\n  (void)tsf;\n  (void)tsi;\n";
+    src.push_str("  SMEM;\n");
+    src.push_str(scratch_ptrs);
+    let mut body = String::new();
+    body.push_str("  const int lane = (int)threadIdx.x & 31, warp = (int)threadIdx.x >> 5;\n  const int g = lane >> 2, t = lane & 3;\n  (void)g;\n  (void)t;\n  (void)warp;\n");
     for &id in &g.used_tb {
         let l = &g.layouts[id];
         let mut terms = Vec::new();
@@ -2028,17 +2044,60 @@ pub fn generate(k: &Kernel, o: &Options) -> Result<Generated, String> {
         } else {
             terms.join(" ^ ")
         };
-        let _ = writeln!(src, "  const int tb{id} = {e};");
+        let _ = writeln!(body, "  const int tb{id} = {e};");
     }
-    src.push_str(&g.out);
+    body.push_str(&g.out);
+    src.push_str(&body);
     src.push_str("}\n");
     let _ = writeln!(
         src,
         "#ifndef TSL_CUDA\nstatic void {name}_body(float **A) {{ {name}({}); }}\nextern \"C\" void {name}_emu(float **A, unsigned gx, unsigned gy, unsigned gz, unsigned bx, unsigned smem) {{ kemu_launch({name}_body, A, gx, gy, gz, bx, 1, smem); }}\n#endif",
         call.join(", ")
     );
+    let metal = if o.arch == METAL {
+        if smem > 32 * 1024 {
+            return Err(format!(
+                "{}: needs {} KB of threadgroup memory; Metal allows 32",
+                k.name,
+                smem.div_ceil(1024)
+            ));
+        }
+        let mut m = String::from(METAL_PRELUDE);
+        let _ = writeln!(m, "\n#define TSO_DOT {scratch}");
+        let mut ps = Vec::new();
+        for (i, p) in k.params.iter().enumerate() {
+            match &p.kind {
+                PKind::Array { dtype, .. } => {
+                    let t = match dtype {
+                        DType::F32 => "float",
+                        DType::F16 => "khalf",
+                        DType::I32 => "int",
+                        DType::Bool => "uchar",
+                    };
+                    let c = if stored.contains(&i) { "" } else { "const " };
+                    ps.push(format!("device {c}{t} *a{i} [[buffer({i})]]"));
+                }
+                PKind::Scalar(d) => ps.push(format!("constant {} &a{i} [[buffer({i})]]", cty(*d))),
+            }
+        }
+        ps.push("uint3 blockIdx [[threadgroup_position_in_grid]]".into());
+        ps.push("uint3 threadIdx [[thread_position_in_threadgroup]]".into());
+        let _ = writeln!(m, "kernel void {name}({}) {{", ps.join(", "));
+        let _ = writeln!(
+            m,
+            "  threadgroup float4 tsmem4[{}];\n  threadgroup uchar *tsmem = (threadgroup uchar *)tsmem4;",
+            smem.div_ceil(16).max(1)
+        );
+        m.push_str(scratch_ptrs);
+        m.push_str(&body);
+        m.push_str("}\n");
+        Some(m)
+    } else {
+        None
+    };
     Ok(Generated {
         name,
+        metal,
         source: src,
         threads,
         smem,

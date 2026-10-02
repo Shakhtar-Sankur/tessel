@@ -3,8 +3,8 @@
 A tile language for GPU and TPU kernels, and its compiler, written from
 scratch in Rust with no dependencies. Kernels are written once, against
 *tiles* (small blocks of values), and compiled for each target: CUDA for
-NVIDIA tensor cores, and Pallas for Google TPUs; Metal (Apple GPUs) is
-next.
+NVIDIA tensor cores, the Metal Shading Language for Apple GPUs, and Pallas
+for Google TPUs.
 
 ```python
 kernel matmul(A: f16[M, K], B: f16[K, N], C: f16[M, N]):
@@ -37,8 +37,28 @@ masked. CI runs every kernel in Pallas's TPU interpret mode against NumPy
 and lowers it through Mosaic for TPU v5e; `scripts/colab_tpu.sh` runs
 them on a Colab TPU against XLA.
 
+For Apple GPUs (`tessel metal`), the CUDA generator emits the Metal
+Shading Language instead: the same layouts and kernel bodies, a SIMD-group
+of 32 threads in place of a warp, `simd_shuffle_xor` for reductions,
+threadgroup memory for shared memory, address-space-qualified pointers,
+and matmuls on the SIMT path, without tensor-core instructions. The
+helpers the kernels call are written twice, once per language
+(`src/prelude.cuh`, `src/prelude.metal`); a configuration needing more
+than Metal's 32 KB of threadgroup memory is refused. Every kernel the
+emulator tests for CUDA it also tests as generated for Metal (no tensor
+cores), and `examples/metal_cases.rs` writes 19 cases (each kernel in
+`kernels/`, the LLM engine's among them, with inputs) that CI checks three
+ways: run on the emulator against the interpreter, type-checked by clang
+against a stand-in for Metal's standard library with real address spaces
+(`scripts/metal_syntax.sh`), and compiled by Apple's compiler on a macOS
+runner, which also runs them on the GPU with `scripts/metal_run.swift`
+and checks every output where the runner has a Metal device. Nothing has
+been timed on Apple hardware.
+
 Kernels so far: `kernels/` (matmul, FlashAttention, paged decode
-attention, softmax, RMSNorm).
+attention, softmax, RMSNorm, and the LLM engine's: embedding, fused QKV
+projection, rotary embeddings, the paged KV cache, packed causal prefill,
+decode attention, SwiGLU, logits).
 
 ## Results on a Tesla T4
 
@@ -212,11 +232,15 @@ interpreter on the emulator in CI) and keeps the fastest. 100 tokens/s is
 cargo build --release
 ./target/release/tessel run attention flash_attention --shapes 2x100x32,2x100x32,2x100x32,2x100x32
 ./target/release/tessel cuda matmul matmul --shapes 2048x2048,2048x2048,2048x2048
+./target/release/tessel metal matmul matmul --shapes 1024x1024,1024x1024,1024x1024 --meta BM=64,BN=64,BK=32
 ./target/release/tessel pallas attention flash_attention --shapes 2x256x64,2x256x64,2x256x64,2x256x64
 ./target/release/tessel bench            # on an NVIDIA GPU
 bash scripts/colab.sh                     # Colab or Kaggle (T4): tests, benchmarks, report
 python3 scripts/pallas_check.py --lower   # TPU kernels, interpret mode (needs jax)
 bash scripts/colab_tpu.sh                 # in Colab (TPU): the same on a TPU, and against XLA
+cargo run --release --example metal_cases -- write out   # on a Mac: the Metal cases,
+swift scripts/metal_run.swift out                         # run on its GPU,
+cargo run --release --example metal_cases -- check out   # and checked
 ./target/release/tessel llm-tiny /tmp/tiny && echo '[[1, 5, 9]]' > /tmp/p.json
 ./target/release/tessel llm /tmp/tiny --prompts /tmp/p.json --device emu --max-tokens 16 --pages 64
 bash scripts/llm_colab.sh                 # Kaggle or Colab (T4): TinyLlama-1.1B against transformers

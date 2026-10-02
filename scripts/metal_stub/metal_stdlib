@@ -1,0 +1,54 @@
+// A stand-in for <metal_stdlib>, just enough of it to type-check tessel's
+// generated Metal kernels with clang on a machine without Xcode
+// (scripts/metal_syntax.sh). Address spaces are real clang address spaces,
+// so a threadgroup pointer passed where device memory is expected is an
+// error here as it is in Metal. It checks syntax and types, not codegen:
+// only Apple's compiler (the macOS CI job) proves a kernel compiles.
+#pragma once
+#define kernel
+#define device __attribute__((address_space(1)))
+#define constant __attribute__((address_space(2)))
+#define threadgroup __attribute__((address_space(3)))
+typedef unsigned char uchar;
+typedef unsigned short ushort;
+typedef unsigned int uint;
+typedef _Float16 half;
+#define TV(T, N) typedef T T##N __attribute__((ext_vector_type(N)));
+#define TVS(T) TV(T, 2) TV(T, 3) TV(T, 4)
+TVS(float) TVS(uint) TVS(int) TVS(ushort)
+#undef TV
+#undef TVS
+// Metal's vector constructors, float4(a, b, c, d) and float4(s); a
+// function-like macro leaves the type name itself alone.
+#define VEC(T)                                                                  \
+  inline T##2 make_##T##2(T s) { return (T##2){s, s}; }                         \
+  inline T##2 make_##T##2(T a, T b) { return (T##2){a, b}; }                    \
+  inline T##4 make_##T##4(T s) { return (T##4){s, s, s, s}; }                   \
+  inline T##4 make_##T##4(T a, T b, T c, T d) { return (T##4){a, b, c, d}; }
+VEC(float) VEC(uint) VEC(int)
+#undef VEC
+#define float2(...) make_float2(__VA_ARGS__)
+#define float4(...) make_float4(__VA_ARGS__)
+#define uint2(...) make_uint2(__VA_ARGS__)
+#define uint4(...) make_uint4(__VA_ARGS__)
+#define int2(...) make_int2(__VA_ARGS__)
+#define int4(...) make_int4(__VA_ARGS__)
+namespace metal {
+template <class T, class U> inline T as_type(U u) {
+  static_assert(sizeof(T) == sizeof(U), "as_type between types of different sizes");
+  return __builtin_bit_cast(T, u);
+}
+enum class mem_flags { mem_none, mem_device, mem_threadgroup };
+void threadgroup_barrier(mem_flags);
+void simdgroup_barrier(mem_flags);
+float simd_shuffle_xor(float, ushort);
+int simd_shuffle_xor(int, ushort);
+float exp(float);
+float log(float);
+float sqrt(float);
+float rsqrt(float);
+float fabs(float);
+float fmax(float, float);
+float fmin(float, float);
+float fma(float, float, float);
+} // namespace metal

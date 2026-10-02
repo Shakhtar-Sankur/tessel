@@ -6,6 +6,10 @@
 // warp barriers. Blocks run one after another, so shared memory is one
 // buffer reused by every block. Kernels are written so that every thread
 // reaches every barrier and every warp operation, as CUDA requires.
+// The kernels qualify shared-memory pointers with TSP and write 64-bit
+// indices as KI64, which the Metal prelude defines its own way.
+#define TSP
+#define KI64 long long
 #if defined(__CUDACC_RTC__) || defined(__CUDACC__)
 #define TSL_CUDA 1
 #define KDEV __device__ __forceinline__
